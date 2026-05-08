@@ -1,232 +1,246 @@
-# cQED-Fast
+# cQED Fast
 
-**Graph-based Variational Autoencoder for fast inverse design of superconducting quantum circuits.**
+`cQED Fast` is a generative framework for superconducting quantum circuit design based on Graph Neural Networks (GNNs) and Variational Autoencoders (VAEs).
 
-cQED-Fast learns a continuous latent representation of circuit topologies and physical parameters, enabling both *circuit reconstruction* and *observable-conditioned generation*: given a set of target Hamiltonian observables (qubit frequencies, decay rates, anharmonicities), the model can propose valid circuit designs that match them.
+The main goal of the project is to address an **inverse quantum design problem**:
 
----
+> Given desired quantum properties or Hamiltonian parameters, automatically generate a superconducting circuit topology and its physical parameters.
 
-## Overview
+Traditional simulation tools can solve the *forward problem*: starting from a circuit, they compute its Hamiltonian and physical observables.  
+This project instead focuses on the inverse direction, learning how to generate circuits directly from target quantum specifications.
 
-Superconducting quantum circuits are described as **hierarchical graphs**: each macro-node represents a composite building block (transmon, resonator, coupler, …), which is in turn described by a small inner graph of circuit elements. cQED-Fast encodes this two-level structure into a compact latent vector and decodes it back into a valid graph with physical parameters.
+The idea is to teach a neural network how to combine elementary cQED building blocks — such as capacitors, inductors, Josephson junctions, resonators, and couplings — in order to create physically meaningful superconducting circuits.
 
-The model follows the **bidirectional CktGen paradigm**, jointly training two branches:
+This approach enables:
+- inverse quantum circuit design
+- automated exploration of superconducting architectures
+- topology generation
+- parameter optimization
+- latent-space interpolation between circuits
+- generative discovery of new cQED implementations
 
-| Branch | Input | Latent | Role |
-|--------|-------|--------|------|
-| Circuit branch | Graph `G` | `z^c` | Encodes topology + parameters |
-| Observable branch | Hamiltonian observables | `z^s` | Encodes measured/simulated specs |
-
-Both branches are aligned in latent space so that `z^c ≈ z^s` for the same circuit, making it possible to use observable queries at inference time.
-
----
-
-## Architecture
-
-```
-               ┌──────────────────────────┐
-Circuit G ───► │  GraphVAEEncoder         │ ──► μ^c, Σ^c, z^c ──► Decoder ──► G'
-               │  (InnerGIN + OuterGIN    │                    └──► ParamDecoder ──► θ̂
-               │   + Transformer)         │
-               └──────────────────────────┘
-                                                      ▲
-               ┌──────────────────────────┐           │ alignment loss
-Observables ──► │  SpecEncoder (MLP)       │ ──► μ^s, Σ^s, z^s
-               └──────────────────────────┘
-                          │
-                          └──► ObsClassifier ──► ŝ (classifier guidance)
-```
-
-### Encoder (`src/vae_model/encoder.py`)
-1. **InnerEncoder** — GIN message passing on each subgraph block → node embedding `h_v`
-2. **OuterGIN** — GIN on the outer circuit graph using `[SubgType one-hot | h_v]` features
-3. **Transformer Encoder** — cross-node attention with learnable `μ_tok` / `Σ_tok` tokens
-4. Reparameterization → `z^c`
-
-### Decoder (`src/vae_model/decoder.py`)
-- **TransformerTopologyDecoder** — autoregressive generation of macro-nodes (GGNN-based)
-- **ParamDecoder** — GraphSAGE network that predicts physical parameters `θ` given the generated topology
-
-### Observable Encoder (`src/vae_model/obs_encoder.py`)
-- **SpecEncoder** — per-slot MLP embedding of Hamiltonian observables with missing-value masking → `z^s`
-- **ObsClassifier** — auxiliary heads for classifier guidance from `z^c`
-
-### Circuit-to-Graph (`src/circuit2graph/`)
-- `definitions.py` — canonical registry of subgraph types (`SubgType`) and their physical attributes (`ATTR_INDEX`)
-- `topology.py` — constructs the two-level graph representation from raw circuit data
-- `compression.py` — compresses repeated inner-graph patterns into macro-nodes
+The project is inspired by recent generative approaches for classical circuit generation, adapted here to superconducting quantum hardware and cQED systems.
 
 ---
 
-## Training objective
+# Project Structure
 
-The full loss (Eq. 8 of the CktGen paper) is:
-
-```
-L = λ_KL · L_KL  +  L^c_R  +  L^s_R  +  L_C  +  L_CG  +  L_NCE
-```
-
-| Term | Description |
-|------|-------------|
-| `L^c_R` | Reconstruction from `z^c` (topology + parameters) |
-| `L^s_R` | Reconstruction from `z^s` (generative pathway from observables) |
-| `L_KL` | KL to `N(0,I)` + symmetric KL between the two branches |
-| `L_C` | SmoothL1 latent alignment: `z^c ≈ z^s` |
-| `L_CG` | Classifier guidance: `z^c → observables` |
-| `L_NCE` | Contrastive InfoNCE loss between `(z^s, z^c)` pairs |
-
-β-annealing is used to warm up the KL term over the first `warmup_steps` gradient steps.
-
----
-
-## Supported circuit elements
-
-| `SubgType` | Description |
-|------------|-------------|
-| `FEEDLINE` | Transmission-line feedline |
-| `TRANSMON` | Single transmon qubit |
-| `RESONATOR` | Microwave resonator |
-| `C_COUPLER` | Capacitive coupler |
-| `TC` | Transmon–capacitor block |
-| `RC` | Resonator–capacitor block |
-| `RCT` | Resonator–capacitor–transmon block |
-| `TCT` | Transmon–coupler–transmon block |
-| `I_COUPLER` | Inductive coupler |
-| `RIND` | Inductive resonator |
-
-Physical attributes tracked: inductance `L`, capacitance `C`, resonator length, coupling capacitances `Cc`, `Cc_qr`, `Cc_rf`, wire separation `D`, coupling length `l`.
-
-Target Hamiltonian observables: qubit frequencies `f_1`, `f_2`, decay rates `κ_1`, `κ_2`, anharmonicities `χ_11`, `χ_22`, cross-Kerr `χ_12`.
-
----
-
-## Project structure
-
-```
+```text
 cQED_Fast/
-├── train_vae.py          # Training script (full CLI)
-├── inference_vae.py      # Inference, sampling, and evaluation
-└── src/
-    ├── circuit2graph/
-    │   ├── definitions.py    # SubgType enum, ATTR_INDEX, SubgDef registry
-    │   ├── topology.py       # Two-level graph construction
-    │   └── compression.py    # Macro-node compression
-    ├── data_loader/
-    │   ├── schema.py         # Dataset definitions and observable vocabulary
-    │   ├── loader_vae.py     # DataLoader with train/val/test splits and scalers
-    │   └── processing.py     # Feature normalization utilities
-    └── vae_model/
-        ├── vae.py            # GraphVAE — top-level module
-        ├── encoder.py        # GraphVAEEncoder (InnerGIN + OuterGIN + Transformer)
-        ├── decoder.py        # TransformerTopologyDecoder + ParamDecoder
-        └── obs_encoder.py    # SpecEncoder + ObsClassifier + contrastive losses
+│
+├── train_vae.py
+├── inference_vae.py
+├── src/
+│   ├── circuit2graph/
+│   ├── data_loader/
+│   └── vae_model/
+└── data/
 ```
+
+Main components:
+
+- `train_vae.py`  
+  Main training script for the VAE model.
+
+- `inference_vae.py`  
+  Script used for evaluation and inference.
+
+- `src/circuit2graph/`  
+  Utilities for converting superconducting circuits into graph representations.
+
+- `src/data_loader/`  
+  Dataset loading, preprocessing, normalization, and batching utilities.
+
+- `src/vae_model/`  
+  Encoder, decoder, latent-space modules, and loss definitions.
 
 ---
 
-## Installation
+# Dataset Generation
 
-```bash
-# Python 3.9+
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-pip install torch_geometric
-pip install matplotlib numpy
+The dataset is generated by simulating superconducting circuits with external tools such as QuLTRA.
+
+For each circuit topology and parameter configuration, the simulation produces the corresponding Hamiltonian and physical observables.  
+The final dataset therefore consists of pairs:
+
+```text
+(circuit topology + parameters) <-> (Hamiltonian / observables)
 ```
 
-> PyTorch ≥ 2.0 is recommended to take advantage of `torch.compile` acceleration.
+These samples are then used to train the generative model.
+
+The repository currently includes datasets for:
+- single qubits
+- resonators
+- qubit-resonator systems
+- coupled qubit architectures
+
+Datasets are stored as text files inside the `data/` directory.
 
 ---
 
-## Usage
+# Model Overview
 
-### Training
+The framework combines graph neural networks with a variational autoencoder architecture.
+
+The model learns two complementary representations:
+
+- a graph representation of the circuit
+- a vector representation of the Hamiltonian or observables
+
+The circuit branch encodes the topology and circuit parameters into a latent space, while the decoder reconstructs the graph and its parameters.
+
+The Hamiltonian branch maps physical observables into the same latent space, enabling the generation of candidate circuits starting from target quantum properties.
+
+The architecture is designed to:
+- reconstruct circuit topologies
+- predict physical parameters
+- align latent representations of circuits and observables
+- generate new circuit candidates
+
+---
+
+# Graph Representation
+
+Superconducting circuits are represented as graphs.
+
+Nodes correspond to circuit elements such as:
+- capacitors
+- inductors
+- Josephson junctions
+- resonators
+
+Edges describe physical connections and couplings between components.
+
+To improve latent-space encoding, the original circuit topology is internally rewritten using simplified structures called *macronodes*, which preserve the physical meaning while reducing graph complexity.
+
+---
+
+# Encoder and Decoder
+
+The model contains two encoders:
+
+## Circuit Encoder
+
+The circuit encoder processes graph-structured circuit data using graph neural networks and transformer-based modules.
+
+It extracts:
+- topology information
+- node embeddings
+- edge structure
+- circuit parameters
+
+and compresses them into a latent representation.
+
+## Hamiltonian Encoder
+
+The Hamiltonian encoder processes spectral and observable information and maps it into the same latent space used by the circuit encoder.
+
+## Decoder
+
+The decoder reconstructs:
+- circuit topology
+- node types
+- edge connectivity
+- physical parameters
+
+from the latent representation.
+
+The topology decoder is transformer-based and autoregressive, enabling the generation of new graph structures.
+
+---
+
+# Training Objective
+
+The training loss combines multiple terms:
+
+- topology reconstruction loss
+- parameter reconstruction loss
+- KL regularization
+- latent alignment loss
+- contrastive latent learning
+
+The objective is not only to reconstruct existing circuits, but also to organize the latent space in a physically meaningful way, so that similar Hamiltonians correspond to similar circuit implementations.
+
+---
+
+# Installation
+
+Create a Python environment and install the required dependencies.
+
+Example:
 
 ```bash
-# Default training run
+python -m venv venv
+source venv/bin/activate
+```
+
+Install the main dependencies:
+
+```bash
+pip install torch
+pip install torch-geometric
+pip install numpy matplotlib
+```
+
+Additional packages may be required depending on the environment and CUDA configuration.
+
+---
+
+# Training
+
+To train the model:
+
+```bash
 python train_vae.py
-
-# Override hyperparameters
-python train_vae.py --nz 64 --epochs 200 --batch_size 32
-
-# Disable observable branch (circuit-only ablation)
-python train_vae.py --spec_recon_scale 0 --nce_scale 0 --cg_scale 0
 ```
 
-### Resume from checkpoint
+Training parameters can be modified directly inside the script or passed through command-line arguments.
+
+Example:
 
 ```bash
-python train_vae.py --checkpoint best_vae.pt --epochs 400
+python train_vae.py --epochs 200 --batch_size 32
 ```
 
-### Evaluation only
+---
+
+# Inference
+
+To run inference or evaluation:
 
 ```bash
-python train_vae.py --eval_only --checkpoint best_vae.pt
+python inference_vae.py
 ```
 
-### Inference and generation
-
-```bash
-python inference_vae.py --checkpoint best_vae.pt
-```
-
----
-
-## Key hyperparameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `nz` | 128 | Latent space dimension |
-| `beta_max` | 1e-4 | Maximum KL weight |
-| `warmup_steps` | 21 900 | Steps to reach `beta_max` (~20 epochs on 35 k samples, batch 32) |
-| `spec_recon_scale` | 0.3 | Weight of the observable branch reconstruction (0 = circuit-only) |
-| `nce_scale` | 0.5 | Contrastive loss weight |
-| `cg_scale` | 0.5 | Classifier guidance loss weight |
-| `align_scale` | 0.5 | Latent alignment loss weight |
-| `max_nodes` | 12 | Maximum number of macro-nodes |
-| `batch_size` | 128 | Training batch size |
-| `epochs` | 300 | Maximum training epochs |
-| `patience` | 40 | Early stopping patience (validation epochs) |
+The inference script can be used to:
+- reconstruct circuits
+- generate candidate topologies
+- sample latent representations
+- evaluate predicted parameters
+- visualize generated circuits
 
 ---
 
-## Checkpoint format
+# Current Results
 
-Checkpoints saved by `train_vae.py` contain:
+Initial experiments show that the model is able to:
+- reconstruct circuit topologies correctly
+- predict physical parameters with low relative error
+- generate circuit implementations compatible with target Hamiltonian properties
 
-```python
-{
-    "model_state":   ...,   # GraphVAE state_dict
-    "step":          int,   # global gradient steps (for β-annealing resume)
-    "config":        dict,  # full configuration used
-    "scalers":       bytes, # pickle(scalers) for feature normalization
-    "train_losses":  list,  # per-epoch training loss history
-    "val_losses":    list,
-    "best_val_loss": float,
-    "epoch":         int,
-}
-```
+Validation is performed by re-simulating the predicted circuits and comparing their Hamiltonian observables with the target ones using QuLTRA simulations.
 
 ---
 
-## Extending the model
+# Future Developments
 
-To add a new circuit element type:
+Possible future directions include:
+- increasing dataset size
+- improving VAE fine-tuning
+- adding more complex superconducting architectures
+- introducing additional cQED building blocks
+- improving topology generalization
+- applying the framework to practical quantum hardware design problems
 
-1. Add its physical attribute(s) to `ATTR_INDEX` in `src/circuit2graph/definitions.py` if not already present.
-2. Add a new member to `SubgType`.
-3. Add a `SubgDef` entry to `SUBG_DEFS` with `inner_nodes`, `inner_edges`, `attrs`, `color`, and `legend`.
-4. Implement the corresponding merge rule in the compression module.
-
-To add a new observable:
-
-1. Append the new name to `OBS_SLOTS` in `src/data_loader/schema.py`.
-2. Write a parser function and register it in `OBS_PARSERS` / `DATASETS`.
-
----
-
-## References
-
-- Flam-Shepherd et al., *"CktGen: Graph generative model for circuit design"* — the bidirectional VAE paradigm this model is based on.
-- Kipf & Welling, *"Variational Graph Auto-Encoders"*, 2016.
-- Li et al., *"Gated Graph Sequence Neural Networks"*, 2016.
+The long-term objective is to build a fully generative framework capable of automatically designing useful superconducting quantum circuits from desired quantum functionalities.
