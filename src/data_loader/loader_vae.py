@@ -25,6 +25,11 @@ Public API
 ----------
     load_all_datasets_vae(train_frac, val_frac, seed, max_nodes)
         → (train_list, val_list, test_list, scalers)
+
+    load_inference_datasets_vae(seed, max_nodes)
+        → (samples_dict, scalers_dict)
+        Returns ALL datasets (including inference-only ones) as a dict
+        keyed by dataset name. Scalers are fitted on each dataset independently.
 """
 
 from __future__ import annotations
@@ -38,10 +43,13 @@ from torch_geometric.data import Data
 
 from circuit2graph import CQEDTopology, SubgType, SUBG_DEFS
 from circuit2graph import graphlize
-from data_loader.schema import DATASETS, DatasetDef, OBS_PARSERS
-from data_loader.schema import OBS_SLOTS, N_OBS_SLOTS, OBS_IDX
+from data_loader.schema import (
+    DATASETS, DatasetDef, OBS_PARSERS,
+    OBS_SLOTS, N_OBS_SLOTS, OBS_IDX,
+    ROW_PARSERS, _is_header,  # _is_header re-exported from datasets._base
+    train_datasets,
+)
 from data_loader.processing import ParamScaler, ObsScaler, DatasetScalers
-from data_loader.schema import ROW_PARSERS, _is_header
 from data_loader.processing import (
     _extract_params,
     _fill_attrs,
@@ -104,19 +112,10 @@ def _build_enc_tensors(
         xi, ei = build_encoder_inner_feats(dummy, attrs_sc)
         n_in = xi.shape[0]
         inner_x_list.append(xi)
-        # Store edge_index with LOCAL (zero-based) indices for this block only.
-        # The intra-sample offset (block-to-block within one sample) and the
-        # cross-sample offset (sample-to-sample within a batch) are both applied
-        # in _prepare_batch() in vae.py, which holds the single source of truth
-        # for index accumulation. Applying any offset here would cause a
-        # double-shift when _prepare_batch adds inner_offset on top.
         inner_ei_list.append(ei)
         inner_n_nodes.append(n_in)
 
-    # Assemble inner tensors: apply intra-sample (block-to-block) offsets so
-    # enc_inner_ei is self-consistent within the sample. The cross-sample offset
-    # is still deferred to _prepare_batch(), which adds its accumulated
-    # inner_offset (= total inner nodes of all preceding samples) once.
+    # Apply intra-sample (block-to-block) offsets
     intra_offset = 0
     inner_ei_shifted: list[torch.Tensor] = []
     for ei, n_in in zip(inner_ei_list, inner_n_nodes):
@@ -147,7 +146,6 @@ def _build_enc_tensors(
     enc_macro_pos = pos_vals.unsqueeze(1)   # [n_circuit, 1]
 
     # Outer edge_index (circuit↔circuit only, no offset yet)
-    adj       = compressed._adj()
     id_to_idx = {node.node_id: i for i, node in enumerate(circ_nodes)}
     oc_edges: list[tuple[int, int]] = []
     for u_id, v_id in compressed._edges:
@@ -183,14 +181,12 @@ def _topo_to_data_vae(
     Build a Data object with VAE fields.
     Encoder tensors are pre-computed and stored so _prepare_batch() is cheap.
     """
-    # ── Inner graph topology ids ───────────────────────────────────────
     circ_nodes       = compressed._nodes
     topology_ids     = torch.tensor([int(n.subg_type) for n in circ_nodes], dtype=torch.long)
     block_param_lens = torch.tensor(
         [len(SUBG_DEFS[n.subg_type].attrs) for n in circ_nodes], dtype=torch.long
     )
 
-    # ── Outer edge index (circuit↔circuit) ────────────────────────────
     id_to_idx = {n.node_id: i for i, n in enumerate(circ_nodes)}
     fwd = [(id_to_idx[u], id_to_idx[v]) for u, v in compressed._edges]
     bwd = [(v, u) for u, v in fwd]
@@ -200,7 +196,6 @@ def _topo_to_data_vae(
         if all_e else torch.zeros((2, 0), dtype=torch.long)
     )
 
-    # ── Pre-computed encoder tensors ──────────────────────────────────
     enc = _build_enc_tensors(compressed, y_scaled)
 
     data                  = Data()
@@ -211,17 +206,14 @@ def _topo_to_data_vae(
     data.block_param_lens = block_param_lens
     data.y                = torch.tensor(y_scaled, dtype=torch.float)
     data.dataset_name     = ds_name
-    # Pre-compute G_true_ns once at load time to avoid calling data_to_graph_ns()
-    # at every forward pass.
     data.g_true_ns        = data_to_graph_ns(data, None)
-    # Pre-computed encoder tensors
     data.enc_inner_x        = enc["enc_inner_x"]
     data.enc_inner_ei       = enc["enc_inner_ei"]
-    data.enc_inner_n_nodes  = enc["enc_inner_n_nodes"]   # Python list[int]
+    data.enc_inner_n_nodes  = enc["enc_inner_n_nodes"]
     data.enc_macro_subgtype = enc["enc_macro_subgtype"]
     data.enc_macro_pos      = enc["enc_macro_pos"]
     data.enc_outer_ei       = enc["enc_outer_ei"]
-    data.enc_n_circuit      = enc["enc_n_circuit"]       # Python int
+    data.enc_n_circuit      = enc["enc_n_circuit"]
     return data
 
 
@@ -238,50 +230,22 @@ def _build_samples_vae(
     max_nodes: int,
 ) -> tuple[list[Data], DatasetScalers]:
     """
-    Builds a list of VAE training samples from a raw dataset. This function 
-    transforms raw entries (e.g. circuit parameters + observables) into structured 
-    `Data` objects ready for the model.
+    Builds a list of VAE Data objects from one raw dataset file.
 
-    Workflow
-    --------
-    1. Load raw entries from disk:
-    - Each entry consists of:
-        attrs   : circuit parameters / attributes
-        obs_kw  : raw observable values (keyword format)
+    Parameters
+    ----------
+    ds_name   : key in DATASETS / OBS_PARSERS
+    defn      : DatasetDef descriptor
+    scalers   : existing DatasetScalers (used when fit=False) or None
+    fit       : if True, fit new scalers from this dataset's data
+    rng       : seeded Random for reservoir sampling
+    max_nodes : upper bound on compressed graph size (samples exceeding
+                this are silently discarded)
 
-    2. For each entry:
-    - Instantiate a topology template and fill it with parameters (`_fill_attrs`)
-    - Convert the topology into a compressed graph representation (`graphlize`)
-    - Extract numerical parameter vector (Y_raw)
-    - Parse observables into:
-            obs_vals_raw : values
-            obs_masks_raw: mask (1 = present, 0 = missing)
-
-    3. Convert collected lists into numpy arrays:
-    - Y_raw_np        : [N, param_dim]
-    - obs_vals_np     : [N, N_OBS_SLOTS]
-    - obs_mask_np     : [N, N_OBS_SLOTS]
-
-    4. Fit scalers (only if `fit=True`, typically on training set):
-    - ParamScaler: normalizes circuit parameters
-    - ObsScaler  : normalizes observable values using masks
-    - Store them inside DatasetScalers
-
-    5. Apply scaling:
-    - Parameters are scaled globally
-    - Observables are scaled per-sample (respecting masks)
-
-    6. Build final Data objects:
-    - Combine:
-            * graph structure (compressed topology)
-            * scaled parameters
-            * scaled observables
-            * observable masks
-    - Enforce max_nodes constraint if needed
-
-    7. Return:
-    - samples : list of Data objects (one per circuit)
-    - scalers : fitted scalers (or reused ones if fit=False)
+    Returns
+    -------
+    samples   : list[Data]
+    scalers   : DatasetScalers (fitted or passed through)
     """
     obs_parser  = OBS_PARSERS[ds_name]
     raw_entries = _read_raw(defn.path, ds_name, defn.n_samples, rng)
@@ -297,18 +261,26 @@ def _build_samples_vae(
     for attrs, obs_kw in raw_entries:
         topo       = _fill_attrs(raw_template, attrs)
         compressed = graphlize(topo)
+        if max_nodes and len(compressed._nodes) > max_nodes:
+            continue
         compressed_list.append(compressed)
         Y_raw.append(_extract_params(compressed))
         o_val, o_mask = obs_parser(**obs_kw)
         obs_vals_raw.append(o_val)
         obs_masks_raw.append(o_mask)
 
+    if not compressed_list:
+        raise RuntimeError(
+            f"All rows filtered out for {ds_name} (max_nodes={max_nodes}). "
+            "Check block_params or topology builder."
+        )
+
     Y_raw_np    = np.array(Y_raw, dtype=np.float64)
     obs_vals_np = np.array(obs_vals_raw, dtype=np.float64)
     obs_mask_np = np.array(obs_masks_raw, dtype=np.float64)
 
     if fit:
-        ps = ParamScaler().fit(Y_raw_np)
+        ps  = ParamScaler().fit(Y_raw_np)
         os_ = ObsScaler().fit(obs_vals_np, obs_mask_np)
         scalers = DatasetScalers(ps, os_)
 
@@ -337,7 +309,12 @@ def load_all_datasets_vae(
     max_nodes:  int   = 12,
 ) -> tuple[list, list, list, dict]:
     """
-    Load all registered datasets with VAE-specific fields.
+    Load datasets marked include_train=True and split into train/val/test.
+
+    Datasets with include_train=False (e.g. Three_qubit_capacitive_line) are
+    skipped here but remain available via load_inference_datasets_vae().
+    To add a dataset to training, set include_train=True in its DatasetDef
+    inside schema.py — no other change required.
 
     Returns
     -------
@@ -347,11 +324,18 @@ def load_all_datasets_vae(
     rng = random.Random(seed)
     np.random.seed(seed)
 
+    train_defs = train_datasets()
+
     all_scalers: dict = {}
     all_samples: dict = {}
 
-    print("Loading datasets (VAE mode)…")
-    for ds_name, defn in DATASETS.items():
+    print("Loading datasets (VAE mode, training split)…")
+    print(f"  include_train=True  : {list(train_defs.keys())}")
+    inference_only = [k for k, v in DATASETS.items() if not v.include_train]
+    if inference_only:
+        print(f"  include_train=False : {inference_only}  (inference only)")
+
+    for ds_name, defn in train_defs.items():
         print(f"\n[{ds_name}]")
         samples, ds_scalers = _build_samples_vae(
             ds_name, defn, scalers=None, fit=True, rng=rng,
@@ -370,9 +354,9 @@ def load_all_datasets_vae(
 
     for ds_name, samples in all_samples.items():
         rng.shuffle(samples)
-        N = len(samples)
-        n_test = max(1, int(round(N * (1 - train_frac - val_frac))))
-        n_val = max(1, int(round(N * val_frac)))
+        N       = len(samples)
+        n_test  = max(1, int(round(N * (1 - train_frac - val_frac))))
+        n_val   = max(1, int(round(N * val_frac)))
         n_train = N - n_test - n_val
         train_list.extend(samples[:n_train])
         val_list.extend(samples[n_train: n_train + n_val])
@@ -381,6 +365,47 @@ def load_all_datasets_vae(
     rng.shuffle(train_list)
     rng.shuffle(val_list)
 
-    print(f"\nFinal split: train={len(train_list)}  "
-          f"val={len(val_list)}  test={len(test_list)}")
+    print(
+        f"\nFinal split: train={len(train_list)}  "
+        f"val={len(val_list)}  test={len(test_list)}"
+    )
     return train_list, val_list, test_list, all_scalers
+
+
+def load_inference_datasets_vae(
+    seed:      int = 42,
+    max_nodes: int = 12,
+) -> tuple[dict[str, list[Data]], dict[str, DatasetScalers]]:
+    """
+    Load ALL datasets (including inference-only ones) without a train/val/test
+    split.  Each dataset gets its own scaler fitted on the full set.
+
+    Use this to evaluate generalisation on topologies not seen during training
+    (e.g. Three_qubit_capacitive_line).
+
+    Returns
+    -------
+    samples_dict : dict[ds_name → list[Data]]
+    scalers_dict : dict[ds_name → DatasetScalers]
+    """
+    rng = random.Random(seed)
+    np.random.seed(seed)
+
+    samples_dict: dict[str, list[Data]]          = {}
+    scalers_dict: dict[str, DatasetScalers]      = {}
+
+    print("Loading ALL datasets (inference mode)…")
+    for ds_name, defn in DATASETS.items():
+        tag = "" if defn.include_train else "  [inference-only]"
+        print(f"\n[{ds_name}]{tag}")
+        samples, ds_scalers = _build_samples_vae(
+            ds_name, defn, scalers=None, fit=True, rng=rng,
+            max_nodes=max_nodes,
+        )
+        samples_dict[ds_name] = samples
+        scalers_dict[ds_name] = ds_scalers
+        n_nodes = int(samples[-1].enc_n_circuit)
+        n_p     = int(samples[-1].y.shape[0])
+        print(f"  → {len(samples)} samples | {n_nodes} outer nodes | {n_p} params")
+
+    return samples_dict, scalers_dict

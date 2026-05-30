@@ -857,7 +857,7 @@ class ParamDecoder(nn.Module):
         deg = torch.zeros(N, device=device)
         if edge_index.shape[1] > 0:
             deg.scatter_add_(0, edge_index[1], torch.ones(edge_index.shape[1], device=device))
-        max_deg  = max(float(deg.max().item()), 1.0)
+        max_deg  = max(float(deg.max().item()), 1.0) if N > 0 else 1.0
         pos_denom = max(N - 1, 1)
         for i, st_int in enumerate(node_types):
             x[i, st_int]         = 1.0

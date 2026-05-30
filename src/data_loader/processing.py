@@ -24,7 +24,7 @@ from circuit2graph import CQEDTopology, CQEDNode, SubgType, SUBG_DEFS, graphlize
 from data_loader.schema import (
     DATASETS, DatasetDef, OBS_PARSERS,
     OBS_SLOTS, N_OBS_SLOTS, OBS_IDX,
-    ROW_PARSERS, _is_header,
+    ROW_PARSERS, _is_header, train_datasets,
 )
 
 
@@ -107,7 +107,10 @@ class DatasetScalers:
 # ===========================================================================
 
 N_SUBTYPES  = len(SubgType)
-N_DATASETS  = len(DATASETS)
+# N_DATASETS counts only training topologies (include_train=True).
+# Inference-only datasets (e.g. Three_qubit_capacitive_line) are excluded
+# so that any model component that embeds dataset identity has a stable size.
+N_DATASETS  = len(train_datasets())
 
 
 # ===========================================================================

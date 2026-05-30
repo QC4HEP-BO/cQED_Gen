@@ -16,6 +16,13 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 
+try:
+    import networkx as nx
+    _HAS_NX = True
+except ImportError:
+    _HAS_NX = False
+    print("WARN: networkx non installato — i plot di grafo saranno disabilitati.")
+
 REPO_ROOT = Path(__file__).resolve().parent
 SRC_ROOT  = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -24,7 +31,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vae_model.vae import GraphVAE
-from data_loader.loader_vae import load_all_datasets_vae
+from data_loader.loader_vae import load_all_datasets_vae, load_inference_datasets_vae
+from data_loader.schema import train_datasets
 from vae_model.decoder import data_to_graph_ns
 from data_loader.schema import DATASETS
 from circuit2graph import SubgType, SUBG_DEFS
@@ -46,27 +54,68 @@ DS_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#B279A2"]
 
 
 
-def _unique_attr_names_from_graph(g):
-    """Return display names in the exact same order as sample.y/scaler columns.
+def _unit_for_attr(attr: str) -> str:
+    """Return the physical unit for display names such as L3, C3, Cc2."""
+    if attr in UNITS:
+        return UNITS[attr]
+    base = attr.rstrip("0123456789")
+    return UNITS.get(base, "")
 
-    Important for TCT: the compressed TCT node has attrs
-    [L, C, Cc, L2, C2].  Using DATASETS[ds].block_params or a single dict
-    would relabel/drop duplicated L/C columns.
+
+def _unique_attr_names_from_graph(g):
+    """Return unique display names in the same order as sample.y/scaler columns.
+
+    A compressed TCT block exports [L, C, Cc, L2, C2].  Those names are
+    local to the block: L2/C2 mean "second transmon inside this TCT", not
+    global parameter names.  Therefore a later standalone TRANSMON must become
+    L3/C3, otherwise the dict used for reports/plots overwrites one of the
+    transmons and only two qubits appear.
     """
     names = []
-    counts = {}
+    counts: dict[str, int] = {}
+    transmon_count = 0
+    pending_c_for_transmon: int | None = None
+    pending_c2_for_transmon: int | None = None
+
+    def indexed(base: str, idx: int) -> str:
+        return base if idx == 1 else f"{base}{idx}"
+
+    def next_non_transmon_name(base: str) -> str:
+        counts[base] = counts.get(base, 0) + 1
+        return base if counts[base] == 1 else f"{base}{counts[base]}"
+
     for st_int in g.node_types:
         for attr_name in SUBG_DEFS[SubgType(st_int)].attrs:
-            base = attr_name
-            if base in ("L2", "C2"):
-                display = base
-            elif base in counts:
-                counts[base] += 1
-                display = f"{base}{counts[base]}"
+            if attr_name == "L":
+                transmon_count += 1
+                pending_c_for_transmon = transmon_count
+                names.append(indexed("L", transmon_count))
+
+            elif attr_name == "C":
+                if pending_c_for_transmon is None:
+                    names.append(next_non_transmon_name("C"))
+                else:
+                    names.append(indexed("C", pending_c_for_transmon))
+                    pending_c_for_transmon = None
+
+            elif attr_name == "L2":
+                transmon_count += 1
+                pending_c2_for_transmon = transmon_count
+                names.append(indexed("L", transmon_count))
+
+            elif attr_name == "C2":
+                if pending_c2_for_transmon is None:
+                    names.append(next_non_transmon_name("C2"))
+                else:
+                    names.append(indexed("C", pending_c2_for_transmon))
+                    pending_c2_for_transmon = None
+
             else:
-                counts[base] = 1
-                display = base
-            names.append(display)
+                names.append(next_non_transmon_name(attr_name))
+
+    if len(names) != len(set(names)):
+        raise RuntimeError(f"Duplicate parameter names after graph naming: {names}")
+
     return names
 
 
@@ -408,7 +457,7 @@ def print_report(branch_name: str, results: dict, decode_used_ds_ids: bool, ds_m
         print(f"    {'Attr':<10} {'R²':>10} {'RMSE':>14} {'N_valid':>8}  scala")
         print("    " + "-" * 48)
         for attr, m in pm_metrics.items():
-            unit = UNITS.get(attr, "")
+            unit = _unit_for_attr(attr)
             log_label = "(log10)" if m.get("log_scale") else "      "
             print(f"    {attr:<10} {_fmt(m['r2']):>10} {_fmt(m['rmse']):>10} {unit:<4} {m['n_valid']:>6}  {log_label}")
     print()
@@ -465,10 +514,10 @@ def plot_scatter(results: dict, out_path: str, n_samples: int, branch: str, ckpt
             use_log = (t.max() / t.min()) > 100
             if use_log:
                 tv, pv = np.log10(t), np.log10(p)
-                ax_label = f"log10 {attr} [{UNITS.get(attr, '?')}]"
+                ax_label = f"log10 {attr} [{_unit_for_attr(attr) or '?'}]"
             else:
                 tv, pv = t, p
-                ax_label = f"{attr} [{UNITS.get(attr, '?')}]"
+                ax_label = f"{attr} [{_unit_for_attr(attr) or '?'}]"
             ax.scatter(tv, pv, s=5, alpha=0.30, color=color, linewidths=0, rasterized=True)
             lo = min(tv.min(), pv.min())
             hi = max(tv.max(), pv.max())
@@ -479,7 +528,7 @@ def plot_scatter(results: dict, out_path: str, n_samples: int, branch: str, ckpt
             ax.set_aspect("equal", adjustable="box")
             r2 = r2_score(tv, pv)
             rms = rmse(t, p)
-            unit = UNITS.get(attr, "")
+            unit = _unit_for_attr(attr)
             short_ds = ds_name.replace("_", " ")
             if len(short_ds) > 26:
                 short_ds = short_ds[:24] + "…"
@@ -539,17 +588,209 @@ def plot_topo_breakdown(results: dict, out_path: str, branch: str, ckpt_path: st
     print(f"  Plot topologia salvato -> {out_path}")
 
 
+
+# ===========================================================================
+# Graph drawing utilities (networkx)
+# ===========================================================================
+
+_SUBGTYPE_LABEL: dict[int, str] = {}
+_SUBGTYPE_COLOR: dict[int, str] = {}
+
+def _init_node_style():
+    if _SUBGTYPE_LABEL:
+        return
+    _STYLE = {
+        "TRANSMON":  ("T",   "#4C78A8"),
+        "RESONATOR": ("R",   "#54A24B"),
+        "C_COUPLER": ("Cc",  "#F58518"),
+        "I_COUPLER": ("Ic",  "#E45756"),
+        "FEEDLINE":  ("F",   "#B279A2"),
+        "TCT":       ("TCT", "#76B7B2"),
+        "RCT":       ("RCT", "#EDC948"),
+        "RC":        ("RC",  "#FF9DA7"),
+        "RIND":      ("RI",  "#9C755F"),
+    }
+    for st in SubgType:
+        name = st.name
+        label, color = _STYLE.get(name, (name[:3], "#AAAAAA"))
+        _SUBGTYPE_LABEL[int(st)] = label
+        _SUBGTYPE_COLOR[int(st)] = color
+
+_init_node_style()
+
+
+def _graph_ns_to_nx(g):
+    G = nx.Graph()
+    for i, st_int in enumerate(g.node_types):
+        label = _SUBGTYPE_LABEL.get(st_int, "?")
+        attr_parts = []
+        if hasattr(g, "attrs") and i < len(g.attrs) and g.attrs[i]:
+            for k, v in g.attrs[i].items():
+                attr_parts.append(f"{k}={v:.2e}" if isinstance(v, float) else f"{k}={v}")
+        G.add_node(i, st_int=st_int, label=label, attr_str="\n".join(attr_parts))
+    for u, v in g.edges:
+        G.add_edge(u, v)
+    return G
+
+
+def _draw_single_graph(ax, g, title="", show_attrs=True, title_color="black"):
+    if not _HAS_NX:
+        ax.text(0.5, 0.5, "networkx non disponibile", ha="center", va="center",
+                transform=ax.transAxes, fontsize=8, color="red")
+        return
+    if not g.node_types:
+        ax.text(0.5, 0.5, "(grafo vuoto)", ha="center", va="center",
+                transform=ax.transAxes, fontsize=8, color="gray")
+        ax.set_title(title, fontsize=8, color=title_color, pad=3)
+        ax.axis("off")
+        return
+    G   = _graph_ns_to_nx(g)
+    n   = len(G.nodes)
+    pos = nx.spring_layout(G, seed=42) if n > 2 else nx.shell_layout(G)
+    node_colors = [_SUBGTYPE_COLOR.get(G.nodes[i]["st_int"], "#AAAAAA") for i in G.nodes]
+    nx.draw_networkx_edges(G, pos, ax=ax, edge_color="#555555", width=1.5, alpha=0.7)
+    nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors, node_size=800, alpha=0.92)
+    if show_attrs:
+        labels = {i: G.nodes[i]["label"] + ("\n" + G.nodes[i]["attr_str"] if G.nodes[i]["attr_str"] else "") for i in G.nodes}
+    else:
+        labels = {i: G.nodes[i]["label"] for i in G.nodes}
+    nx.draw_networkx_labels(G, pos, labels=labels, ax=ax, font_size=6, font_color="white", font_weight="bold")
+    ax.set_title(title, fontsize=8, color=title_color, pad=3)
+    ax.axis("off")
+
+
+@torch.no_grad()
+def plot_topology_errors(vae, data, scalers, ds_name, out_path, device,
+                         n_show=20, batch_size=128, stochastic=False, branch="circuit"):
+    if not _HAS_NX:
+        print("  plot_topology_errors: networkx non disponibile, skip.")
+        return
+    samples = [s for s in data if s.dataset_name == ds_name]
+    if not samples:
+        print(f"  Nessun campione trovato per dataset '{ds_name}', skip.")
+        return
+    pairs = []
+    vae.eval()
+    for i in range(0, len(samples), batch_size):
+        batch = samples[i:i + batch_size]
+        if branch == "spec":
+            obs_v = torch.stack([s.obs_vals for s in batch]).to(device)
+            obs_m = torch.stack([s.obs_mask for s in batch]).to(device)
+            z, _, _ = vae.spec_encoder.encode(obs_v, obs_m)
+        else:
+            z, _, _ = vae.encode(batch, scalers)
+        graphs_pred = vae.decode(z, stochastic=stochastic)
+        scaler = scalers[ds_name].param_scaler
+        for s, g_pred in zip(batch, graphs_pred):
+            g_true = data_to_graph_ns(s, scaler)
+            pairs.append((g_true, g_pred))
+        if len(pairs) >= n_show:
+            break
+    pairs = pairs[:n_show]
+    n_cols = min(len(pairs), 10)
+    n_rows_groups = (len(pairs) + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows_groups * 2, n_cols, figsize=(2.8 * n_cols, 3.2 * n_rows_groups * 2))
+    if n_rows_groups * 2 == 1 and n_cols == 1:
+        axes = [[axes]]
+    elif n_rows_groups * 2 == 1:
+        axes = [list(axes)]
+    elif n_cols == 1:
+        axes = [[ax] for ax in axes]
+    else:
+        axes = [list(row) for row in axes]
+    for r in axes:
+        for ax in r:
+            ax.axis("off")
+    for idx, (g_true, g_pred) in enumerate(pairs):
+        group = idx // n_cols
+        col   = idx % n_cols
+        tm    = topo_match(g_true.node_types, g_true.edges, g_pred.node_types, g_pred.edges)
+        pred_color = "#27AE60" if tm["exact"] else "#E74C3C"
+        _draw_single_graph(axes[group * 2][col],     g_true,  title=f"TRUE #{idx+1}",  show_attrs=False)
+        _draw_single_graph(axes[group * 2 + 1][col], g_pred,
+                           title=f"PRED #{idx+1}\nnodes:{g_pred.node_types}",
+                           show_attrs=False, title_color=pred_color)
+    n_exact = sum(topo_match(t.node_types, t.edges, p.node_types, p.edges)["exact"] for t, p in pairs)
+    fig.suptitle(f"Topologia: {ds_name.replace('_', ' ')}  |  ramo={branch}\n"
+                 f"Corretti: {n_exact}/{len(pairs)}  (mai visto in training)",
+                 fontsize=10, y=1.01)
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close()
+    print(f"  Plot topologia errori salvato -> {out_path}")
+
+
+@torch.no_grad()
+def plot_latent_samples(vae, out_path, device, n_show=20, stochastic=True, seed=42):
+    if not _HAS_NX:
+        print("  plot_latent_samples: networkx non disponibile, skip.")
+        return
+    torch.manual_seed(seed)
+    z      = torch.randn(n_show, vae.nz, device=device)
+    graphs = vae.decode(z, stochastic=stochastic)
+    topo_counter = {}
+    for g in graphs:
+        key = str(sorted(g.node_types))
+        topo_counter[key] = topo_counter.get(key, 0) + 1
+    n_cols = min(n_show, 5)
+    n_rows = (n_show + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.5 * n_cols, 4.0 * n_rows))
+    if n_rows == 1 and n_cols == 1:
+        axes = [[axes]]
+    elif n_rows == 1:
+        axes = [list(axes)]
+    elif n_cols == 1:
+        axes = [[ax] for ax in axes]
+    else:
+        axes = [list(row) for row in axes]
+    for r in axes:
+        for ax in r:
+            ax.axis("off")
+    for idx, g in enumerate(graphs):
+        row = idx // n_cols
+        col = idx % n_cols
+        type_names = [_SUBGTYPE_LABEL.get(t, "?") for t in g.node_types]
+        _draw_single_graph(axes[row][col], g,
+                           title=f"sample #{idx+1}\n[{', '.join(type_names)}]",
+                           show_attrs=True)
+    summary_lines = [f"{k}: {v}" for k, v in sorted(topo_counter.items(), key=lambda x: -x[1])]
+    summary = "Topologie: " + "  |  ".join(summary_lines[:6])
+    fig.suptitle(f"GraphVAE — campionamento dal latent space  z ~ N(0,I)\n{summary}",
+                 fontsize=10, y=1.01)
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close()
+    print(f"  Plot campionamento latent space salvato -> {out_path}")
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Inference + evaluation del GraphVAE")
     p.add_argument("--ckpt", default="checkpoints/vae_best.pt")
     p.add_argument("--split", default="test", choices=["test", "val", "train"])
-    p.add_argument("--n-samples", type=int, default=2000)
+    p.add_argument("--n-samples", type=int, default=750)
     p.add_argument("--out-dir", default="plots")
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--stochastic", action="store_true")
+    p.add_argument(
+        "--inference-only", action="store_true",
+        help=(
+            "Carica TUTTI i dataset (inclusi include_train=False) e valuta anche "
+            "le topologie mai viste in training (es. Three_qubit_capacitive_line). "
+            "I scalers per questi dataset vengono fittati sui loro stessi dati, "
+            "separatamente dagli scalers del training."
+        ),
+    )
     p.add_argument("--only-circuit", action="store_true")
     p.add_argument("--only-spec", action="store_true")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--plot-topo-errors", action="store_true")
+    p.add_argument("--topo-errors-dataset", default="Three_qubit_capacitive_line")
+    p.add_argument("--topo-errors-n", type=int, default=20)
+    p.add_argument("--plot-latent-samples", action="store_true")
+    p.add_argument("--latent-n", type=int, default=20)
+    p.add_argument("--only-latent", action="store_true",
+        help="Esegue solo il campionamento dal latent space, salta rami A/B e caricamento dataset.")
     return p.parse_args()
 
 
@@ -569,19 +810,45 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  parametri totali: {n_params:,}")
 
-    print("\nCaricamento dataset (VAE loader)...")
-    train_data, val_data, test_data, _ = load_all_datasets_vae(
-        train_frac=cfg.get("train_frac", 0.70),
-        val_frac=cfg.get("val_frac", 0.15),
-        seed=cfg.get("seed", 42),
-        max_nodes=cfg.get("max_nodes", 12),
-    )
-    data = {"train": train_data, "val": val_data, "test": test_data}[args.split]
-    print(f"  campioni nello split '{args.split}': {len(data)}")
+    if args.only_latent:
+        print("\n--only-latent: skip caricamento dataset.")
+        data = []
+    elif args.inference_only:
+        print("\nCaricamento dataset (VAE loader)...")
+        # Load ALL datasets (train + inference-only), each with its own scaler.
+        # The split argument is ignored: each dataset is evaluated in full.
+        inference_only_names = [
+            k for k, v in __import__("data_loader.schema", fromlist=["DATASETS"])
+            .DATASETS.items() if not v.include_train
+        ]
+        print(f"  modalità --inference-only: carico anche {inference_only_names}")
+        all_samples, all_scalers_inf = load_inference_datasets_vae(
+            seed      = cfg.get("seed", 42),
+            max_nodes = cfg.get("max_nodes", 12),
+        )
+        # For train-datasets, use the checkpoint scalers.
+        # For inference-only datasets, use the freshly fitted scalers.
+        merged_scalers = dict(scalers)  # checkpoint scalers (train datasets)
+        for ds_name, sc in all_scalers_inf.items():
+            if ds_name not in merged_scalers:
+                merged_scalers[ds_name] = sc  # inference-only dataset scaler
+        scalers = merged_scalers
+        # Flatten all samples into a single list for the runner functions.
+        data = [s for samples in all_samples.values() for s in samples]
+        print(f"  campioni totali (tutti i dataset): {len(data)}")
+    else:
+        train_data, val_data, test_data, _ = load_all_datasets_vae(
+            train_frac=cfg.get("train_frac", 0.70),
+            val_frac=cfg.get("val_frac", 0.15),
+            seed=cfg.get("seed", 42),
+            max_nodes=cfg.get("max_nodes", 12),
+        )
+        data = {"train": train_data, "val": val_data, "test": test_data}[args.split]
+        print(f"  campioni nello split '{args.split}': {len(data)}")
 
     out_dir = Path(args.out_dir)
 
-    if not args.only_spec:
+    if not args.only_spec and not args.only_latent:
         print("\n[Ramo A] Circuit encoder  G -> z^c -> decoder...")
         t0 = time.time()
         results_circ, used_ds_ids_c, ds_map_c = run_circuit_encoder(model, data, scalers, device, batch_size=args.batch_size, stochastic=args.stochastic)
@@ -590,7 +857,7 @@ def main() -> None:
         plot_scatter(results_circ, str(out_dir / "inference_circuit_enc_params.png"), args.n_samples, "circuit-enc", args.ckpt)
         plot_topo_breakdown(results_circ, str(out_dir / "inference_circuit_enc_topo.png"), "circuit-enc", args.ckpt)
 
-    if not args.only_circuit:
+    if not args.only_circuit and not args.only_latent:
         print("\n[Ramo B] Spec encoder  obs -> z^s -> decoder...")
         t0 = time.time()
         results_spec, used_ds_ids_s, ds_map_s = run_spec_encoder(model, data, scalers, device, batch_size=args.batch_size, stochastic=args.stochastic)
@@ -598,6 +865,31 @@ def main() -> None:
         print_report("Spec Encoder  (obs -> z^s -> Ghat)", results_spec, used_ds_ids_s, ds_map_s)
         plot_scatter(results_spec, str(out_dir / "inference_spec_enc_params.png"), args.n_samples, "spec-enc", args.ckpt)
         plot_topo_breakdown(results_spec, str(out_dir / "inference_spec_enc_topo.png"), "spec-enc", args.ckpt)
+
+    if args.plot_topo_errors:
+        if not args.inference_only and not args.only_latent:
+            print("\nATTENZIONE: --plot-topo-errors richiede --inference-only.")
+        else:
+            ds_err = args.topo_errors_dataset
+            print(f"\n[Plot topologia errori] dataset={ds_err}  n={args.topo_errors_n}")
+            for branch_name in (["circuit"] if args.only_circuit else
+                                ["spec"]    if args.only_spec    else
+                                ["circuit", "spec"]):
+                plot_topology_errors(
+                    vae=model, data=data, scalers=scalers, ds_name=ds_err,
+                    out_path=str(out_dir / f"topo_errors_{ds_err}_{branch_name}.png"),
+                    device=device, n_show=args.topo_errors_n,
+                    batch_size=args.batch_size, stochastic=args.stochastic,
+                    branch=branch_name,
+                )
+
+    if args.plot_latent_samples:
+        print(f"\n[Plot latent samples]  n={args.latent_n}  stochastic={args.stochastic}")
+        plot_latent_samples(
+            vae=model, out_path=str(out_dir / "latent_samples.png"),
+            device=device, n_show=args.latent_n,
+            stochastic=args.stochastic, seed=args.seed,
+        )
 
     print("\nDone.\n")
 

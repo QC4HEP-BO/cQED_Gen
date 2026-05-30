@@ -80,15 +80,20 @@ from vae_model.vae import GraphVAE
 # Default config
 # ---------------------------------------------------------------------------
 # Note on warmup_steps:
-#   Let n_dataset be the number of training samples, n_batch the batch size, and 
-#   n_warmup_epochs be the number of epochs over which we want to apply KL warmup.
-#   The number of steps per epoch is:
-#       n_steps_per_epoch = n_dataset / n_batch
-#   Then:
-#       warmup_steps = n_warmup_epochs * n_steps_per_epoch
-#   During these warmup_steps, beta increases from 0 to beta_max.
-#   This allows the decoder to first learn to reconstruct properly,
-#   before the KL term starts to strongly regularize the latent space.
+#   Let n_train be the total training samples, n_batch the batch size, and
+#   n_warmup_epochs the number of warm-up epochs.
+#
+#       steps_per_epoch = n_train / n_batch
+#       warmup_steps    = n_warmup_epochs * steps_per_epoch
+#
+#   Current sizing (9 train datasets × 10k samples × 0.70 train_frac = ~63 k):
+#       steps_per_epoch ≈ 63_000 / 128 ≈ 492
+#       20 warmup epochs → warmup_steps ≈ 9_840  (rounded to 10_000)
+#
+#   When adding/removing datasets, update warmup_steps proportionally or
+#   use the helper printed at training start:
+#       'beta-annealing: warmup_steps=X  ~Y epoche'
+#   and adjust until Y ≈ 20.
 
 DEFAULT_CONFIG: dict = {
     #architecture
@@ -114,7 +119,7 @@ DEFAULT_CONFIG: dict = {
     # beta-annealing
     "beta_start":       0.0,
     "beta_max":         1e-4,
-    "warmup_steps":     21_900,  # ~20 epoche su dataset 35k/batch32
+    "warmup_steps":     10_000,  # ~20 epoche su ~63k samples / batch128 (9 train ds)
     # loss weights
     "attrs_scale":      0.01,
     "align_scale":      0.5,
@@ -131,7 +136,7 @@ DEFAULT_CONFIG: dict = {
     # training
     "batch_size":       128,
     "epochs":           300,
-    "val_every":        5,     
+    "val_every":        1,     
     "patience":         40,
     "lr_patience":      10,
     "train_frac":       0.70,
@@ -382,7 +387,7 @@ def load_checkpoint(
     model.eval()
 
     # Apply torch.compile to submodules (same as in train())
-    _apply_compile(model, cfg)
+    _apply_compile(model, config)
 
     scalers      = pickle.loads(ckpt["scalers"]) if "scalers" in ckpt else {}
     train_losses = ckpt.get("train_losses", [])
@@ -764,9 +769,14 @@ def train(config: dict | None = None) -> GraphVAE:
     _calibrate_edge_pos_weight(model, train_data, cfg.get("edge_pos_weight", None))
 
     #optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
-    )
+    optimizer = torch.optim.AdamW([
+        {"params": model.spec_encoder.parameters(),   "lr": cfg["lr"] * 3},
+        {"params": model.obs_classifier.parameters(), "lr": cfg["lr"] * 3},
+        {"params": [
+            p for n, p in model.named_parameters()
+            if not n.startswith("spec_encoder") and not n.startswith("obs_classifier")
+        ]},
+    ], lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=cfg["lr_patience"],
     )
@@ -836,9 +846,14 @@ def resume_train(checkpoint_path: str, config_override: dict | None = None) -> G
         persistent_workers=(cfg.get("num_workers", 0) > 0),
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
-    )
+    optimizer = torch.optim.AdamW([
+        {"params": model.spec_encoder.parameters(),   "lr": cfg["lr"] * 3},
+        {"params": model.obs_classifier.parameters(), "lr": cfg["lr"] * 3},
+        {"params": [
+            p for n, p in model.named_parameters()
+            if not n.startswith("spec_encoder") and not n.startswith("obs_classifier")
+        ]},
+    ], lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=cfg["lr_patience"],
     )
