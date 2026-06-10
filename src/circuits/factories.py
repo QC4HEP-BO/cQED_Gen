@@ -125,3 +125,163 @@ def create_two_qubit_capacitive(
     ]
     circuit = qu.QCircuit(net, F_MIN, F_MAX)
     return circuit
+
+
+def create_qubit_resonator_resonator(
+    Cj: float, Lj: float, Cc_qr: float, Cc_rr: float, l_res1: float, l_res2: float
+):
+    """
+    Qubit coupled to two resonators in series.
+    Topology: T – Cc_qr – R1 – Cc_rr – R2
+
+    Parameters
+    ----------
+    Cj     : qubit junction capacitance [F]
+    Lj     : qubit junction inductance [H]
+    Cc_qr  : qubit–resonator coupling capacitance [F]
+    Cc_rr  : resonator–resonator coupling capacitance [F]
+    l_res1 : length of first (qubit-side) resonator [m]
+    l_res2 : length of second resonator [m]
+    """
+    if not _HAS_QULTRA:
+        raise ImportError("qultra is required for circuit simulation.")
+    if not _check_freq(l_res1, Lj, Cj) or not _check_freq(l_res2, Lj, Cj):
+        return None
+    net = [
+        qu.C(0, 1, Cj),
+        qu.J(0, 1, Lj, 1),
+        qu.C(1, 2, Cc_qr),
+        qu.CPW(2, 0, l_res1),   # R1 (qubit-side, λ/4)
+        qu.C(2, 3, Cc_rr),
+        qu.CPW(3, 0, l_res2),   # R2 (λ/4)
+    ]
+    circuit = qu.QCircuit(net, F_MIN, F_MAX)
+    return circuit
+
+
+def create_resonator_qubit_resonator(
+    Cj: float, Lj: float, Cc_qr1: float, Cc_qr2: float, l_res1: float, l_res2: float
+):
+    """
+    Qubit flanked by two resonators, one on each side.
+    Topology: R1 – Cc_qr1 – T – Cc_qr2 – R2
+
+    Parameters
+    ----------
+    Cj     : qubit junction capacitance [F]
+    Lj     : qubit junction inductance [H]
+    Cc_qr1 : coupling capacitance between R1 and qubit [F]
+    Cc_qr2 : coupling capacitance between qubit and R2 [F]
+    l_res1 : length of first resonator (Cc_qr1 side) [m]
+    l_res2 : length of second resonator (Cc_qr2 side) [m]
+
+    graphlize output:
+        C_COUPLER(Cc_qr1) – RESONATOR(R1) – RCT(T+Cc_qr2+R2)
+        block_params = [["Cc"], ["length"], ["length","Cc","L","C"]]
+    """
+    if not _HAS_QULTRA:
+        raise ImportError("qultra is required for circuit simulation.")
+    if not _check_freq(l_res1, Lj, Cj) or not _check_freq(l_res2, Lj, Cj):
+        return None
+    net = [
+        qu.C(0, 1, Cj),
+        qu.J(0, 1, Lj, 1),
+        qu.C(1, 2, Cc_qr1),
+        qu.CPW(2, 0, l_res1),   # R1 (λ/4)
+        qu.C(1, 3, Cc_qr2),
+        qu.CPW(3, 0, l_res2),   # R2 (λ/4)
+    ]
+    circuit = qu.QCircuit(net, F_MIN, F_MAX)
+    return circuit
+
+
+def create_two_qubit_resonator(
+    Cj1: float, Lj1: float, Cj2: float, Lj2: float,
+    Cc_qr1: float, Cc_qr2: float, l_res: float
+):
+    """
+    Two qubits coupled via a shared mediator resonator.
+    Topology: T1 – Cc_qr1 – R – Cc_qr2 – T2
+
+    Parameters
+    ----------
+    Cj1    : qubit-1 junction capacitance [F]
+    Lj1    : qubit-1 junction inductance [H]
+    Cj2    : qubit-2 junction capacitance [F]
+    Lj2    : qubit-2 junction inductance [H]
+    Cc_qr1 : qubit-1 to resonator coupling capacitance [F]
+    Cc_qr2 : qubit-2 to resonator coupling capacitance [F]
+    l_res  : mediator resonator length [m]
+
+    graphlize output:
+        C_COUPLER(Cc_qr1) – TRANSMON(T1) – RCT(R+Cc_qr2+T2)
+        block_params = [["Cc"], ["L","C"], ["length","Cc","L","C"]]
+    """
+    if not _HAS_QULTRA:
+        raise ImportError("qultra is required for circuit simulation.")
+    if not _check_freq(l_res, Lj1, Cj1) or not _check_freq(l_res, Lj2, Cj2):
+        return None
+    net = [
+        qu.C(0, 1, Cj1), qu.J(0, 1, Lj1, 1),
+        qu.C(0, 2, Cj2), qu.J(0, 2, Lj2, 1),
+        qu.C(1, 3, Cc_qr1),
+        qu.CPW(3, 0, l_res),    # R (λ/4 mediator)
+        qu.C(2, 3, Cc_qr2),
+    ]
+    circuit = qu.QCircuit(net, F_MIN, F_MAX)
+    return circuit
+
+
+def create_three_qubit_capacitive_star(
+    Cj1: float, Lj1: float,
+    Cj2: float, Lj2: float,
+    Cj3: float, Lj3: float,
+    Cc12: float, Cc13: float, Cc23: float
+):
+    """
+    Three transmons all-to-all capacitively coupled (triangle / star).
+    Topology: T1–Cc12–T2, T1–Cc13–T3, T2–Cc23–T3
+
+    graphlize output (triangle → cycle):
+        C_COUPLER(Cc12) – TCT(T1+Cc13+T3) – C_COUPLER(Cc23) – TRANSMON(T2)
+        block_params = [["Cc"], ["L","C","Cc","L2","C2"], ["Cc"], ["L","C"]]
+    """
+    if not _HAS_QULTRA:
+        raise ImportError("qultra is required for circuit simulation.")
+    net = [
+        qu.C(0, 1, Cj1), qu.J(0, 1, Lj1, 1),
+        qu.C(0, 2, Cj2), qu.J(0, 2, Lj2, 1),
+        qu.C(0, 3, Cj3), qu.J(0, 3, Lj3, 1),
+        qu.C(1, 2, Cc12),
+        qu.C(1, 3, Cc13),
+        qu.C(2, 3, Cc23),
+    ]
+    circuit = qu.QCircuit(net, F_MIN, F_MAX)
+    return circuit
+
+
+def create_three_qubit_capacitive_line(
+    Cj1: float, Lj1: float,
+    Cj2: float, Lj2: float,
+    Cj3: float, Lj3: float,
+    Cc12: float, Cc23: float
+):
+    """
+    Three transmons in a linear chain capacitively coupled.
+    Topology: T1 – Cc12 – T2 – Cc23 – T3
+
+    graphlize output:
+        C_COUPLER(Cc12) – TRANSMON(T1) – TCT(T2+Cc23+T3)
+        block_params = [["Cc"], ["L","C"], ["L","C","Cc","L2","C2"]]
+    """
+    if not _HAS_QULTRA:
+        raise ImportError("qultra is required for circuit simulation.")
+    net = [
+        qu.C(0, 1, Cj1), qu.J(0, 1, Lj1, 1),
+        qu.C(0, 2, Cj2), qu.J(0, 2, Lj2, 1),
+        qu.C(0, 3, Cj3), qu.J(0, 3, Lj3, 1),
+        qu.C(1, 2, Cc12),
+        qu.C(2, 3, Cc23),
+    ]
+    circuit = qu.QCircuit(net, F_MIN, F_MAX)
+    return circuit

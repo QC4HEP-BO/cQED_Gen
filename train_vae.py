@@ -136,7 +136,7 @@ DEFAULT_CONFIG: dict = {
     # training
     "batch_size":       128,
     "epochs":           300,
-    "val_every":        1,     
+    "val_every":        5,     
     "patience":         40,
     "lr_patience":      10,
     "train_frac":       0.70,
@@ -769,14 +769,9 @@ def train(config: dict | None = None) -> GraphVAE:
     _calibrate_edge_pos_weight(model, train_data, cfg.get("edge_pos_weight", None))
 
     #optimizer
-    optimizer = torch.optim.AdamW([
-        {"params": model.spec_encoder.parameters(),   "lr": cfg["lr"] * 3},
-        {"params": model.obs_classifier.parameters(), "lr": cfg["lr"] * 3},
-        {"params": [
-            p for n, p in model.named_parameters()
-            if not n.startswith("spec_encoder") and not n.startswith("obs_classifier")
-        ]},
-    ], lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
+    )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=cfg["lr_patience"],
     )
@@ -846,14 +841,9 @@ def resume_train(checkpoint_path: str, config_override: dict | None = None) -> G
         persistent_workers=(cfg.get("num_workers", 0) > 0),
     )
 
-    optimizer = torch.optim.AdamW([
-        {"params": model.spec_encoder.parameters(),   "lr": cfg["lr"] * 3},
-        {"params": model.obs_classifier.parameters(), "lr": cfg["lr"] * 3},
-        {"params": [
-            p for n, p in model.named_parameters()
-            if not n.startswith("spec_encoder") and not n.startswith("obs_classifier")
-        ]},
-    ], lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"],
+    )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=cfg["lr_patience"],
     )

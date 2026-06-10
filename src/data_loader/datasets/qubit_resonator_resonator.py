@@ -2,7 +2,7 @@
 
 Topology (raw):   T – Cc_qr – R1 – Cc_rr – R2
 After graphlize:  C_COUPLER(Cc_qr) – TRANSMON(L,C) – RC(length,Cc_rr) – RESONATOR(length)
-block_params:     [["Cc"], ["L", "C"], ["length", "Cc"], ["length"]]
+block_params:     [["Cc"], ["L", "C"], ["length", "Cc", "dir"], ["length"]]
 
 Columns:  Cq, Lq1, Cc_qr, Cc_rr, L_res1, L_res2
 Chi matrix is 3×3 row-major; order = [R1, R2, Q].
@@ -18,7 +18,7 @@ class QubitResonatorResonator(DatasetBase):
 
     NAME             = "Qubit_resonator_resonator"
     DATA_PATH        = "data/Qubit_resonator_resonator.txt"
-    BLOCK_PARAMS     = [["Cc"], ["L", "C"], ["length", "Cc"], ["length"]]
+    BLOCK_PARAMS     = [["Cc"], ["L", "C"], ["length", "Cc", "dir"], ["length"]]
     OBS_SLOTS_ACTIVE = ["f_1", "f_2", "f_3",
                         "chi_11", "chi_22", "chi_12",
                         "chi_33", "chi_13", "chi_23"]

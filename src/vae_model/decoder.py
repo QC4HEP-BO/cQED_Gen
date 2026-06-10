@@ -1011,6 +1011,7 @@ class ParamDecoder(nn.Module):
         self,
         z:      torch.Tensor,
         G_true: list[SimpleNamespace],
+        attr_perm_indices: list[list[list[int]]] | None = None,
     ) -> torch.Tensor:
         """
         Physical parameter loss — fully batched.
@@ -1022,31 +1023,117 @@ class ParamDecoder(nn.Module):
         """
         device = z.device
 
-        # ── 1. Batched SAGE over all graphs in one shot ──────────────────
-        x_struct_all, h_all, node_to_graph, node_types_flat =             self._embed_nodes_batched(z, G_true, device)
+        # Fast compatibility path: if no permutations were requested, or every
+        # sample only has identity, use exactly the old batched implementation.
+        only_identity = True
+        if attr_perm_indices is not None:
+            for perms in attr_perm_indices:
+                if len(perms) > 1:
+                    only_identity = False
+                    break
+        if attr_perm_indices is None or only_identity:
+            return self._loss_batched_no_permutation(z, G_true)
+
+        pred_flat, target_flat = self._predict_and_target_flat_batched(z, G_true, device)
+        if not pred_flat:
+            return torch.zeros(1, device=device)
+
+        losses: list[torch.Tensor] = []
+        for b, (pred_b, target_b) in enumerate(zip(pred_flat, target_flat)):
+            perms = attr_perm_indices[b] if attr_perm_indices is not None else [list(range(target_b.numel()))]
+            if len(perms) <= 1:
+                losses.append(F.mse_loss(pred_b, target_b))
+                continue
+
+            perm_losses: list[torch.Tensor] = []
+            for perm in perms:
+                if len(perm) != int(target_b.numel()):
+                    # Defensive fallback: malformed saved permutation must not
+                    # break training; use the unpermuted target for this entry.
+                    perm_losses.append(F.mse_loss(pred_b, target_b))
+                    continue
+                idx = torch.tensor(perm, dtype=torch.long, device=device)
+                perm_losses.append(F.mse_loss(pred_b, target_b[idx]))
+            losses.append(torch.stack(perm_losses).min())
+
+        return torch.stack(losses).mean()
+
+
+    def _predict_and_target_flat_batched(
+        self,
+        z: torch.Tensor,
+        G_true: list[SimpleNamespace],
+        device: torch.device,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Return differentiable flat predictions and flat targets per graph."""
+        x_struct_all, _h_all, _node_to_graph, node_types_flat = self._embed_nodes_batched(z, G_true, device)
+        if len(node_types_flat) == 0:
+            return [], []
+
+        n_per_graph = torch.tensor([len(g.node_types) for g in G_true], dtype=torch.long, device=device)
+        z_per_node = torch.repeat_interleave(z, n_per_graph, dim=0)
+        z_base_all = self.z_proj(z_per_node)
+
+        pred_by_node: list[torch.Tensor | None] = [None] * len(node_types_flat)
+        type_to_indices: dict[str, list[int]] = {}
+        for idx, st_int in enumerate(node_types_flat):
+            if str(st_int) in self.base_heads:
+                type_to_indices.setdefault(str(st_int), []).append(idx)
+
+        for key, indices in type_to_indices.items():
+            idx_t = torch.tensor(indices, dtype=torch.long, device=device)
+            base_in = torch.cat([z_base_all[idx_t], x_struct_all[idx_t]], dim=-1)
+            preds = self.base_heads[key](base_in)
+            for local_i, flat_i in enumerate(indices):
+                pred_by_node[flat_i] = preds[local_i]
+
+        pred_flat: list[torch.Tensor] = []
+        target_flat: list[torch.Tensor] = []
+        flat_idx = 0
+        for g in G_true:
+            p_parts: list[torch.Tensor] = []
+            t_parts: list[torch.Tensor] = []
+            for i, st_int in enumerate(g.node_types):
+                attrs = SUBG_DEFS[SubgType(st_int)].attrs
+                if not attrs or str(st_int) not in self.base_heads:
+                    flat_idx += 1
+                    continue
+                p_parts.append(pred_by_node[flat_idx])
+                t_parts.append(torch.tensor([g.attrs[i][a] for a in attrs], dtype=torch.float, device=device))
+                flat_idx += 1
+            if p_parts:
+                pred_flat.append(torch.cat(p_parts, dim=0))
+                target_flat.append(torch.cat(t_parts, dim=0))
+            else:
+                pred_flat.append(torch.zeros(0, device=device))
+                target_flat.append(torch.zeros(0, device=device))
+        return pred_flat, target_flat
+
+    def _loss_batched_no_permutation(
+        self,
+        z: torch.Tensor,
+        G_true: list[SimpleNamespace],
+    ) -> torch.Tensor:
+        """Original parameter loss, kept as the exact identity-only path."""
+        device = z.device
+
+        x_struct_all, h_all, node_to_graph, node_types_flat = self._embed_nodes_batched(z, G_true, device)
 
         if len(node_types_flat) == 0:
             return torch.zeros(1, device=device)
 
-        total_nodes = len(node_types_flat)
-
-        # ── 2. z replicated per node (reused from batched embed) ─────────
         n_per_graph = torch.tensor(
             [len(g.node_types) for g in G_true], dtype=torch.long, device=device
         )
-        z_per_node   = torch.repeat_interleave(z, n_per_graph, dim=0)  # [total_nodes, nz]
-        z_base_all   = self.z_proj(z_per_node)    # [total_nodes, hidden]
+        z_per_node   = torch.repeat_interleave(z, n_per_graph, dim=0)
+        z_base_all   = self.z_proj(z_per_node)
 
-        # ── 3. Flat targets ───────────────────────────────────────────────
-        # Build targets in a single Python loop (one pass over G_true)
         all_targets: list[torch.Tensor] = []
         all_st_int:  list[int]          = []
-        flat_idx = 0
-        for b, g in enumerate(G_true):
+        for g in G_true:
             for i, st_int in enumerate(g.node_types):
                 key = str(st_int)
                 if key not in self.base_heads:
-                    flat_idx += 1
                     all_targets.append(None)
                     all_st_int.append(-1)
                     continue
@@ -1055,9 +1142,7 @@ class ParamDecoder(nn.Module):
                     torch.tensor(target_vals, dtype=torch.float, device=device)
                 )
                 all_st_int.append(st_int)
-                flat_idx += 1
 
-        # ── 4. Per-SubgType forward (batched, unchanged) ─────────────────
         type_to_indices: dict[str, list[int]] = {}
         for idx, st_int in enumerate(all_st_int):
             if st_int == -1:

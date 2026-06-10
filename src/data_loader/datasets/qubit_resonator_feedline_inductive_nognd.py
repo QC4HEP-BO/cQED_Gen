@@ -1,8 +1,8 @@
 """Dataset: qubit–resonator–feedline with inductive coupling (no ground).
 
 Topology (raw):   F – Ind – R – Cc_qr – T
-After graphlize:  FEEDLINE – RIND(length, D, l) – RCT(length, Cc_qr, L, C)
-block_params:     [[], ["D", "l"], ["length", "Cc", "L", "C"]]
+After graphlize:  FEEDLINE – RI(length, D, l) – RCT(length, Cc_qr, L, C)
+block_params:     [[], ["length", "D", "l", "dir"], ["length", "Cc", "L", "C", "dir"]]
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ class QubitResonatorFeedlineInductiveNognd(DatasetBase):
 
     NAME             = "Qubit_resonator_feedline_inductive_nognd"
     DATA_PATH        = "data/Qubit_resonator_feedline_inductive_nognd.txt"
-    BLOCK_PARAMS     = [[], ["D", "l"], ["length", "Cc", "L", "C"]]
+    BLOCK_PARAMS     = [[], ["length", "D", "l", "dir"], ["length", "Cc", "L", "C", "dir"]]
     OBS_SLOTS_ACTIVE = ["f_1", "f_2", "kappa_1", "kappa_2",
                         "chi_11", "chi_22", "chi_12"]
     N_SAMPLES        = 10_000

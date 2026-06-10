@@ -43,6 +43,7 @@ from torch_geometric.data import Data
 
 from circuit2graph import CQEDTopology, SubgType, SUBG_DEFS
 from circuit2graph import graphlize
+from circuit2graph.symmetries import expand_to_primitive, compute_automorphisms
 from data_loader.schema import (
     DATASETS, DatasetDef, OBS_PARSERS,
     OBS_SLOTS, N_OBS_SLOTS, OBS_IDX,
@@ -57,6 +58,149 @@ from data_loader.processing import (
     N_SUBTYPES,
 )
 from vae_model.decoder import data_to_graph_ns
+
+
+def _macro_inner_labels(label: str) -> list[str]:
+    """Return primitive labels stored inside a compressed macro label.
+
+    Examples: TCT(T1+C12+T2) -> ["T1", "C12", "T2"].
+    Primitive pass-through labels such as T1 or R1 return [label].
+    """
+    if not label:
+        return []
+    if "(" in label and label.endswith(")"):
+        return [x.strip() for x in label.split("(", 1)[1][:-1].split("+") if x.strip()]
+    return [label]
+
+
+def _slot_to_primitive_key(node, attr_name: str) -> tuple[str, str] | None:
+    """Map one compressed-graph attribute slot to a primitive (label, attr).
+
+    Slots that are not physical primitive attributes, notably compression "dir",
+    return None and are kept fixed by every saved permutation.
+    """
+    if attr_name == "dir":
+        return None
+
+    labels = _macro_inner_labels(node.label)
+    st = node.subg_type
+
+    if st == SubgType.FEEDLINE:
+        return None
+    if st == SubgType.TRANSMON:
+        return (labels[0], attr_name) if labels and attr_name in {"L", "C"} else None
+    if st == SubgType.RESONATOR:
+        return (labels[0], "length") if labels and attr_name == "length" else None
+    if st == SubgType.C_COUPLER:
+        return (labels[0], "Cc") if labels and attr_name == "Cc" else None
+    if st == SubgType.I_COUPLER:
+        return (labels[0], attr_name) if labels and attr_name in {"D", "l"} else None
+
+    # Composite macro-nodes. Their labels preserve the primitive traversal order.
+    if st == SubgType.TC and len(labels) >= 2:
+        t_lab = next((x for x in labels if x.startswith("T")), labels[0])
+        c_lab = next((x for x in labels if x.startswith("C")), labels[-1])
+        if attr_name in {"L", "C"}:
+            return (t_lab, attr_name)
+        if attr_name == "Cc":
+            return (c_lab, "Cc")
+    if st == SubgType.RC and len(labels) >= 2:
+        r_lab = next((x for x in labels if x.startswith("R")), labels[0])
+        c_lab = next((x for x in labels if x.startswith("C")), labels[-1])
+        if attr_name == "length":
+            return (r_lab, "length")
+        if attr_name == "Cc":
+            return (c_lab, "Cc")
+    if st == SubgType.RCT and len(labels) >= 3:
+        r_lab = next((x for x in labels if x.startswith("R")), labels[0])
+        c_lab = next((x for x in labels if x.startswith("C")), labels[1])
+        t_lab = next((x for x in labels if x.startswith("T")), labels[-1])
+        if attr_name == "length":
+            return (r_lab, "length")
+        if attr_name == "Cc":
+            return (c_lab, "Cc")
+        if attr_name in {"L", "C"}:
+            return (t_lab, attr_name)
+    if st == SubgType.TCT and len(labels) >= 3:
+        t_labs = [x for x in labels if x.startswith("T")]
+        c_lab = next((x for x in labels if x.startswith("C")), labels[1])
+        if attr_name in {"L", "C"} and len(t_labs) >= 1:
+            return (t_labs[0], attr_name)
+        if attr_name == "Cc":
+            return (c_lab, "Cc")
+        if attr_name == "L2" and len(t_labs) >= 2:
+            return (t_labs[1], "L")
+        if attr_name == "C2" and len(t_labs) >= 2:
+            return (t_labs[1], "C")
+    if st == SubgType.RI and len(labels) >= 2:
+        r_lab = next((x for x in labels if x.startswith("R")), labels[0])
+        i_lab = next((x for x in labels if x.startswith("I") or x.startswith("Ind")), labels[-1])
+        if attr_name == "length":
+            return (r_lab, "length")
+        if attr_name in {"D", "l"}:
+            return (i_lab, attr_name)
+    return None
+
+
+def _compute_attr_perm_indices(topo: CQEDTopology, compressed: CQEDTopology) -> list[list[int]]:
+    """Compute equivalent flat-parameter permutations from primitive automorphisms.
+
+    The returned lists are index permutations for the scaled flat target y, i.e.
+    y_perm = y[perm]. Identity is always first. Non-physical slots such as "dir"
+    are kept fixed.
+    """
+    slot_keys: list[tuple[str, str] | None] = []
+    key_to_slot: dict[tuple[str, str], int] = {}
+    for node in compressed._nodes:
+        for attr_name in SUBG_DEFS[node.subg_type].attrs:
+            key = _slot_to_primitive_key(node, attr_name)
+            slot_idx = len(slot_keys)
+            slot_keys.append(key)
+            if key is not None:
+                key_to_slot[key] = slot_idx
+
+    n_slots = len(slot_keys)
+    identity = list(range(n_slots))
+    if n_slots == 0:
+        return [identity]
+
+    pg = expand_to_primitive(topo)
+    auts = compute_automorphisms(pg)
+    prim_to_label = {n.prim_id: n.label for n in pg.nodes}
+
+    perms: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for aut in auts:
+        perm = identity.copy()
+        valid = True
+        for dst_slot, key in enumerate(slot_keys):
+            if key is None:
+                continue
+            src_label, attr = key
+            # Convention: permuted target at dst_slot receives value from the
+            # primitive reached by the automorphism from the dst primitive.
+            src_prim = next((pid for pid, lab in prim_to_label.items() if lab == src_label), None)
+            if src_prim is None or src_prim not in aut:
+                valid = False
+                break
+            mapped_label = prim_to_label.get(aut[src_prim])
+            mapped_key = (mapped_label, attr)
+            if mapped_key not in key_to_slot:
+                valid = False
+                break
+            perm[dst_slot] = key_to_slot[mapped_key]
+        if not valid:
+            continue
+        t = tuple(perm)
+        if t not in seen:
+            seen.add(t)
+            perms.append(perm)
+
+    if tuple(identity) not in seen:
+        perms.insert(0, identity)
+    else:
+        perms.sort(key=lambda p: 0 if p == identity else 1)
+    return perms
 from vae_model.encoder import build_encoder_inner_feats, INNER_FEAT_DIM, N_SUBTYPES as _ENC_N_SUBTYPES
 
 
@@ -176,6 +320,7 @@ def _topo_to_data_vae(
     obs_vals_scaled: np.ndarray,
     obs_mask:        np.ndarray,
     ds_name:         str,
+    attr_perm_indices: list[list[int]] | None = None,
 ) -> Data:
     """
     Build a Data object with VAE fields.
@@ -207,6 +352,7 @@ def _topo_to_data_vae(
     data.y                = torch.tensor(y_scaled, dtype=torch.float)
     data.dataset_name     = ds_name
     data.g_true_ns        = data_to_graph_ns(data, None)
+    data.attr_perm_indices = attr_perm_indices if attr_perm_indices is not None else [list(range(int(data.y.numel())))]
     data.enc_inner_x        = enc["enc_inner_x"]
     data.enc_inner_ei       = enc["enc_inner_ei"]
     data.enc_inner_n_nodes  = enc["enc_inner_n_nodes"]
@@ -261,9 +407,10 @@ def _build_samples_vae(
     for attrs, obs_kw in raw_entries:
         topo       = _fill_attrs(raw_template, attrs)
         compressed = graphlize(topo)
+        attr_perm_indices = _compute_attr_perm_indices(topo, compressed)
         if max_nodes and len(compressed._nodes) > max_nodes:
             continue
-        compressed_list.append(compressed)
+        compressed_list.append((compressed, attr_perm_indices))
         Y_raw.append(_extract_params(compressed))
         o_val, o_mask = obs_parser(**obs_kw)
         obs_vals_raw.append(o_val)
@@ -287,11 +434,11 @@ def _build_samples_vae(
     Y_scaled = scalers.param_scaler.transform(Y_raw_np)
 
     samples: list[Data] = []
-    for i, compressed in enumerate(compressed_list):
+    for i, (compressed, attr_perm_indices) in enumerate(compressed_list):
         obs_scaled = scalers.obs_scaler.transform_row(obs_vals_np[i], obs_mask_np[i])
         data = _topo_to_data_vae(
             compressed, Y_scaled[i], obs_scaled, obs_mask_np[i],
-            ds_name,
+            ds_name, attr_perm_indices=attr_perm_indices,
         )
         samples.append(data)
 

@@ -67,7 +67,7 @@ OBS_SLOTS: list[str] = [
     "chi_13",
     "chi_23",
 ]
-N_SAMPLES_OVERRIDE: int | None = 5_000 # here you override the number of data taken per dataset. If you want the default, put "None"
+
 N_OBS_SLOTS: int            = len(OBS_SLOTS)
 OBS_IDX:     dict[str, int] = {name: i for i, name in enumerate(OBS_SLOTS)}
 
@@ -87,7 +87,7 @@ class DatasetDef:
     topology_fn:   Callable
     block_params:  list[list[str]]
     obs_slots:     list[str]
-    n_samples:     int  = 5_000
+    n_samples:     int  = 10_000
     include_train: bool = True
 
 
@@ -119,13 +119,12 @@ def _discover() -> tuple[
                 and not inspect.isabstract(obj)
             ):
                 name = obj.NAME
-                n_samples = N_SAMPLES_OVERRIDE if N_SAMPLES_OVERRIDE is not None else obj.N_SAMPLES
                 defn = DatasetDef(
                     path          = obj.DATA_PATH,
                     topology_fn   = obj.build_topology,
                     block_params  = obj.BLOCK_PARAMS,
                     obs_slots     = obj.OBS_SLOTS_ACTIVE,
-                    n_samples     = n_samples,
+                    n_samples     = obj.N_SAMPLES,
                     include_train = obj.INCLUDE_TRAIN,
                 )
                 datasets[name]    = defn

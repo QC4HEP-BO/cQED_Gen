@@ -4,33 +4,19 @@ compression.py
 
 Graph-compression utilities for the cQED representation.
 
-Transforms a raw CQEDTopology (one node per primitive element) into a
-compressed topology where nodes are directional macronode blocks.
+This module transforms a raw CQEDTopology, where each node is a primitive
+circuit element, into a compressed topology where nodes correspond to meaningful
+subgraph blocks such as RCT, TCT or RI.
 
-DIRECTIONAL CONVENTION
-----------------------
-The BFS tree rooted at ``find_root()`` defines a canonical orientation for
-every branch.  For asymmetric 2- and 3-node blocks the *first* element
-encountered walking away from the root goes into the *left* slot (attrs[0]),
-and the *last* element goes into the *right* slot.
+The file contains the complete compression pipeline:
+- root selection for deterministic traversal
+- low-level branch walking utilities
+- explicit two-node and three-node merge rules
+- a lazy post-pass for remaining coupler-centered patterns
+- graphlize(), the public entry point used by the data loader
 
-This makes the mapping raw → compressed → raw invertible without any
-heuristic ordering (e.g. the old "sort TCT by L-value" trick is gone).
-
-Symmetric blocks (TCT) still encode left/right by raw node-id order so that
-expand_macronodes() can reconstruct them unambiguously.
-
-PUBLIC API
-----------
-graphlize(raw_topology) -> CQEDTopology
-    Main entry point used by the data loader.
-
-EXTENSION GUIDE
----------------
-To add a new merge pattern:
-  1. Add SubgType + SubgDef in definitions.py
-  2. Add an if-block in try_merge_3() or try_merge_2() for linear patterns,
-     OR add a tuple to LAZY_PATTERNS for post-branch patterns.
+Keeping this logic in one file makes the compression algorithm readable while
+leaving static definitions in definitions.py and data structures in topology.py.
 """
 
 from circuit2graph.definitions import SubgType
@@ -42,6 +28,9 @@ from circuit2graph.topology import CQEDNode, CQEDTopology
 # ===========================================================================
 
 def compute_eccentricity(node_id: int, adj: dict) -> int:
+    """
+    Node eccentricity = max BFS distance to any other reachable node.
+    """
     dist  = {node_id: 0}
     queue = [node_id]
     while queue:
@@ -62,7 +51,6 @@ def walk_branch(
     """
     Walk a branch from start_id until a leaf (degree == 1) or hub (degree > 2).
     Returns the ordered list of node_ids visited (not including from_id).
-    The order is root → leaf, which determines left/right in asymmetric blocks.
     """
     path: list[int] = []
     curr = start_id
@@ -90,6 +78,8 @@ def walk_branch(
 # Root selection
 # ===========================================================================
 
+# Priority for the root node (lower = preferred).
+# Extend this dict to change traversal priority for new SubgTypes.
 ROOT_PRIORITY: dict[SubgType, int] = {
     SubgType.FEEDLINE:  0,
     SubgType.C_COUPLER: 1,
@@ -102,8 +92,9 @@ ROOT_PRIORITY: dict[SubgType, int] = {
 def find_root(topology: CQEDTopology) -> int:
     """
     Choose the root of the spanning-tree traversal.
+
     Priority: FEEDLINE > COUPLER > RESONATOR > TRANSMON.
-    Ties: highest degree → lowest eccentricity → lowest node_id.
+    Ties broken by: highest degree → lowest eccentricity → lowest node_id.
     """
     adj      = topology._adj()
     priority = {n.node_id: ROOT_PRIORITY.get(n.subg_type, 99) for n in topology._nodes}
@@ -126,13 +117,43 @@ def find_root(topology: CQEDTopology) -> int:
 # Merge rules
 # ===========================================================================
 
+# HOW TO ADD A NEW MERGE PATTERN
+# --------------------------------
+# Adding a new pattern requires touching exactly TWO files:
+#     1. circuit2graph/definitions.py  — add SubgType member + SubgDef entry
+#     2. THIS file                     — add the merge rule (read below)
+#
+# WHERE to add the rule depends on when the pattern becomes visible:
+#
+#   A) Pattern is a linear chain in the RAW graph
+#      (e.g. T-C-T, T-C-R already contiguous before any merge)
+#        → add an if-block in try_merge_3() or try_merge_2()
+#          (3-node or 2-node patterns respectively).
+#
+#   B) Pattern only emerges AFTER the first compression pass
+#      (i.e. two compressed blocks end up flanking a coupler that
+#       was a hub in the raw graph)
+#        → add a tuple to LAZY_PATTERNS.
+#
+#   C) Pattern can appear in BOTH situations
+#        → add it in both A and B (like RCT currently does).
+#
+# Nothing else needs to change.
+
+
 def _make_node(
     subg_type: SubgType,
     attrs:     dict,
     label:     str,
     tmp_id:    int = 0,
 ) -> CQEDNode:
+    """Create a new (not-yet-inserted) CQEDNode with a placeholder id."""
     return CQEDNode(subg_type=subg_type, attrs=attrs, node_id=tmp_id, label=label)
+
+
+def _ordered_label(*nodes: CQEDNode) -> str:
+    """Human-readable primitive order stored inside the macro-node label."""
+    return "+".join(str(n.label) for n in nodes)
 
 
 def try_merge_3(
@@ -142,218 +163,193 @@ def try_merge_3(
     adj_raw: dict,
 ) -> CQEDNode | None:
     """
-    Try to merge a triplet (n1 → n2-coupler → n3) into a 3-node macronode.
-    n1 is the root-facing node, n3 is the leaf-facing node.
-    Returns a new CQEDNode or None if no pattern matched.
+    Try to merge an ordered triplet (n1, n2-coupler, n3) into a known
+    3-node pattern.  The order is the traversal order from the root along the
+    branch/cycle.  A ``dir`` attribute is stored so expansion can recover
+    whether the internal primitive order is canonical (+1) or reversed (-1).
     """
-    # Only merge through degree-2 capacitive couplers
+    # Only merge through degree-2 capacitive couplers.
     if n2.subg_type != SubgType.C_COUPLER or len(adj_raw[n2.node_id]) != 2:
         return None
 
-    t1, t3 = n1.subg_type, n3.subg_type
+    types = {n1.subg_type, n3.subg_type}
 
-    # ── TCT  (T – C – T)  symmetric ──────────────────────────────────────
-    if t1 == SubgType.TRANSMON and t3 == SubgType.TRANSMON:
-        # No ordering by L — left = n1 (root-side), right = n3 (leaf-side)
-        return _make_node(
-            SubgType.TCT,
-            attrs = {
-                "L":  n1.attrs.get("L",  0.0),
-                "C":  n1.attrs.get("C",  0.0),
-                "Cc": n2.attrs.get("Cc", 0.0),
-                "L2": n3.attrs.get("L",  0.0),
-                "C2": n3.attrs.get("C",  0.0),
-            },
-            label = f"TCT({n1.label}+{n2.label}+{n3.label})",
-        )
-
-    # ── RCT  (R – C – T) ─────────────────────────────────────────────────
-    if t1 == SubgType.RESONATOR and t3 == SubgType.TRANSMON:
+    # R-C-T (+1) or T-C-R (-1) -> one RCT macro-node.
+    if types == {SubgType.TRANSMON, SubgType.RESONATOR}:
+        t = n1 if n1.subg_type == SubgType.TRANSMON  else n3
+        r = n1 if n1.subg_type == SubgType.RESONATOR else n3
+        direction = 1.0 if (
+            n1.subg_type == SubgType.RESONATOR and n3.subg_type == SubgType.TRANSMON
+        ) else -1.0
         return _make_node(
             SubgType.RCT,
             attrs = {
-                "length": n1.attrs.get("length", 0.0),
+                "length": r.attrs.get("length", 0.0),
                 "Cc":     n2.attrs.get("Cc",     0.0),
-                "L":      n3.attrs.get("L",      0.0),
-                "C":      n3.attrs.get("C",      0.0),
+                "L":      t.attrs.get("L",      0.0),
+                "C":      t.attrs.get("C",      0.0),
+                "dir":    direction,
             },
-            label = f"RCT({n1.label}+{n2.label}+{n3.label})",
+            label = f"RCT({_ordered_label(n1, n2, n3)})",
         )
 
-    # ── TCR  (T – C – R) ─────────────────────────────────────────────────
-    if t1 == SubgType.TRANSMON and t3 == SubgType.RESONATOR:
+    # T-C-T.  The two transmons are deliberately kept in traversal order;
+    # do not sort by L, otherwise compression is not invertible.
+    if types == {SubgType.TRANSMON}:
         return _make_node(
-            SubgType.TCR,
+            SubgType.TCT,
             attrs = {
-                "L":      n1.attrs.get("L",      0.0),
-                "C":      n1.attrs.get("C",      0.0),
-                "Cc":     n2.attrs.get("Cc",     0.0),
-                "length": n3.attrs.get("length", 0.0),
+                "L":   n1.attrs.get("L",  0.0),
+                "C":   n1.attrs.get("C",  0.0),
+                "Cc":  n2.attrs.get("Cc", 0.0),
+                "L2":  n3.attrs.get("L",  0.0),
+                "C2":  n3.attrs.get("C",  0.0),
+                "dir": 1.0,
             },
-            label = f"TCR({n1.label}+{n2.label}+{n3.label})",
+            label = f"TCT({_ordered_label(n1, n2, n3)})",
         )
 
-    # ── ADD NEW 3-NODE PATTERNS BELOW ─────────────────────────────────────
     return None
 
-
 def try_merge_2(
-    n1:      CQEDNode,   # root-facing node
-    n2:      CQEDNode,   # leaf-facing node (coupler or element)
+    n1:      CQEDNode,
+    n2:      CQEDNode,
     adj_raw: dict,
 ) -> CQEDNode | None:
     """
-    Try to merge a pair into a known 2-node directional macronode.
-    n1 is the root-facing node, n2 is the leaf-facing node.
-    Returns a new CQEDNode or None.
+    Try to merge an ordered pair into a known 2-node pattern.
+
+    Unlike the old implementation, the coupler may be either first or second
+    in the pair.  This makes F-C-R compress to F-CR, while F-R-C compresses to
+    F-RC.  The SubgType is still RC in both cases; attrs["dir"] is -1 for CR
+    and +1 for RC.
     """
-    if len(adj_raw[n2.node_id]) != 2:
+    # Determine whether exactly one side is a coupler.
+    if n1.subg_type in {SubgType.C_COUPLER, SubgType.I_COUPLER}:
+        coupler, other = n1, n2
+        coupler_first = True
+    elif n2.subg_type in {SubgType.C_COUPLER, SubgType.I_COUPLER}:
+        coupler, other = n2, n1
+        coupler_first = False
+    else:
         return None
 
-    # ── Capacitive coupler patterns ───────────────────────────────────────
-    if n2.subg_type == SubgType.C_COUPLER:
+    # Do not absorb hub couplers.  Leaf and through-couplers are allowed:
+    # this preserves examples such as F-R-C -> F-RC.
+    if len(adj_raw[coupler.node_id]) > 2:
+        return None
 
-        if n1.subg_type == SubgType.TRANSMON:        # T → C  ⟹  TC
+    # Capacitive patterns.
+    if coupler.subg_type == SubgType.C_COUPLER:
+        if other.subg_type == SubgType.TRANSMON:  # T-C (+1) or C-T (-1) -> TC
+            direction = -1.0 if coupler_first else 1.0
             return _make_node(
                 SubgType.TC,
                 attrs = {
-                    "L":  n1.attrs.get("L",  0.0),
-                    "C":  n1.attrs.get("C",  0.0),
-                    "Cc": n2.attrs.get("Cc", 0.0),
+                    "L":   other.attrs.get("L",  0.0),
+                    "C":   other.attrs.get("C",  0.0),
+                    "Cc":  coupler.attrs.get("Cc", 0.0),
+                    "dir": direction,
                 },
-                label = f"TC({n1.label}+{n2.label})",
+                label = f"TC({_ordered_label(n1, n2)})",
             )
 
-        if n1.subg_type == SubgType.RESONATOR:       # R → C  ⟹  RC
+        if other.subg_type == SubgType.RESONATOR:  # R-C (+1) or C-R (-1) -> RC
+            direction = -1.0 if coupler_first else 1.0
             return _make_node(
                 SubgType.RC,
                 attrs = {
-                    "length": n1.attrs.get("length", 0.0),
-                    "Cc":     n2.attrs.get("Cc",     0.0),
+                    "length": other.attrs.get("length", 0.0),
+                    "Cc":     coupler.attrs.get("Cc",     0.0),
+                    "dir":    direction,
                 },
-                label = f"RC({n1.label}+{n2.label})",
+                label = f"RC({_ordered_label(n1, n2)})",
             )
 
-    if n1.subg_type == SubgType.C_COUPLER:
+    # Inductive resonator coupler: R-Ind (+1) or Ind-R (-1) -> RI.
+    if coupler.subg_type == SubgType.I_COUPLER and other.subg_type == SubgType.RESONATOR:
+        direction = -1.0 if coupler_first else 1.0
+        return _make_node(
+            SubgType.RI,
+            attrs = {
+                "length": other.attrs.get("length", 0.0),
+                "D":      coupler.attrs.get("D",      0.0),
+                "l":      coupler.attrs.get("l",      0.0),
+                "dir":    direction,
+            },
+            label = f"RI({_ordered_label(n1, n2)})",
+        )
 
-        if n2.subg_type == SubgType.TRANSMON:        # C → T  ⟹  CT
-            return _make_node(
-                SubgType.CT,
-                attrs = {
-                    "Cc": n1.attrs.get("Cc", 0.0),
-                    "L":  n2.attrs.get("L",  0.0),
-                    "C":  n2.attrs.get("C",  0.0),
-                },
-                label = f"CT({n1.label}+{n2.label})",
-            )
-
-        if n2.subg_type == SubgType.RESONATOR:       # C → R  ⟹  CR
-            return _make_node(
-                SubgType.CR,
-                attrs = {
-                    "Cc":     n1.attrs.get("Cc",     0.0),
-                    "length": n2.attrs.get("length", 0.0),
-                },
-                label = f"CR({n1.label}+{n2.label})",
-            )
-
-    # ── Inductive coupler patterns ────────────────────────────────────────
-    if n2.subg_type == SubgType.I_COUPLER:
-
-        if n1.subg_type == SubgType.RESONATOR:       # R → Ind  ⟹  RI
-            return _make_node(
-                SubgType.RI,
-                attrs = {
-                    "length": n1.attrs.get("length", 0.0),
-                    "D":      n2.attrs.get("D",      0.0),
-                    "l":      n2.attrs.get("l",      0.0),
-                },
-                label = f"RI({n1.label}+{n2.label})",
-            )
-
-    if n1.subg_type == SubgType.I_COUPLER:
-
-        if n2.subg_type == SubgType.RESONATOR:       # Ind → R  ⟹  IR
-            return _make_node(
-                SubgType.IR,
-                attrs = {
-                    "D":      n1.attrs.get("D",      0.0),
-                    "l":      n1.attrs.get("l",      0.0),
-                    "length": n2.attrs.get("length", 0.0),
-                },
-                label = f"IR({n1.label}+{n2.label})",
-            )
-
-    # ── ADD NEW 2-NODE PATTERNS BELOW ─────────────────────────────────────
     return None
 
 
 # ---------------------------------------------------------------------------
 # Lazy merge patterns (post-branch-decomposition pass)
 # ---------------------------------------------------------------------------
+
 # Each entry is a 4-tuple:
 #   (frozenset of the two outer SubgTypes,
 #    merged SubgType,
 #    attr_builder(coupler, na, nb) → dict,
 #    label_builder(coupler, na, nb) → str)
 #
-# IMPORTANT: for directional blocks, na is the root-facing neighbour and nb
-# is the leaf-facing neighbour.  The lazy merge pass determines this from
-# the compressed graph's BFS-tree structure (see _lazy_merge below).
-#
 # ADD NEW LAZY PATTERNS HERE — one tuple per pattern.
 
+def _node_rank(node: CQEDNode) -> tuple[int, int]:
+    """Traversal rank used as a deterministic proxy for distance from root."""
+    return (node.node_id, id(node))
+
+
+def _ordered_lazy_endpoints(na: CQEDNode, nb: CQEDNode) -> tuple[CQEDNode, CQEDNode]:
+    """Return endpoints in deterministic root-to-leaf / canonical order."""
+    return (na, nb) if _node_rank(na) <= _node_rank(nb) else (nb, na)
+
+
+def _build_lazy_rct(coupler: CQEDNode, na: CQEDNode, nb: CQEDNode) -> CQEDNode:
+    first, second = _ordered_lazy_endpoints(na, nb)
+    t = first if first.subg_type == SubgType.TRANSMON else second
+    r = first if first.subg_type == SubgType.RESONATOR else second
+    direction = 1.0 if (
+        first.subg_type == SubgType.RESONATOR and second.subg_type == SubgType.TRANSMON
+    ) else -1.0
+    return CQEDNode(
+        subg_type = SubgType.RCT,
+        attrs = {
+            "length": r.attrs.get("length", 0.0),
+            "Cc":     coupler.attrs.get("Cc",     0.0),
+            "L":      t.attrs.get("L",      0.0),
+            "C":      t.attrs.get("C",      0.0),
+            "dir":    direction,
+        },
+        node_id = coupler.node_id,
+        label = f"RCT({_ordered_label(first, coupler, second)})",
+    )
+
+
+def _build_lazy_tct(coupler: CQEDNode, na: CQEDNode, nb: CQEDNode) -> CQEDNode:
+    first, second = _ordered_lazy_endpoints(na, nb)
+    return CQEDNode(
+        subg_type = SubgType.TCT,
+        attrs = {
+            "L":   first.attrs.get("L",  0.0),
+            "C":   first.attrs.get("C",  0.0),
+            "Cc":  coupler.attrs.get("Cc", 0.0),
+            "L2":  second.attrs.get("L",  0.0),
+            "C2":  second.attrs.get("C",  0.0),
+            "dir": 1.0,
+        },
+        node_id = coupler.node_id,
+        label = f"TCT({_ordered_label(first, coupler, second)})",
+    )
+
+
+# Each entry is a 3-tuple:
+#   (frozenset of the two outer SubgTypes,
+#    central coupler SubgType,
+#    node_builder(coupler, na, nb) -> CQEDNode)
 LAZY_PATTERNS: list[tuple] = [
-
-    # R–C–T  →  RCT  (root=R, leaf=T)
-    (
-        frozenset({SubgType.RESONATOR, SubgType.TRANSMON}),
-        SubgType.RCT,
-        lambda coupler, na, nb: {
-            "length": (na if na.subg_type == SubgType.RESONATOR else nb).attrs.get("length", 0.0),
-            "Cc":     coupler.attrs.get("Cc", 0.0),
-            "L":      (na if na.subg_type == SubgType.TRANSMON  else nb).attrs.get("L",      0.0),
-            "C":      (na if na.subg_type == SubgType.TRANSMON  else nb).attrs.get("C",      0.0),
-        },
-        lambda coupler, na, nb: (
-            f"RCT({na.label}+{coupler.label}+{nb.label})"
-            if na.subg_type == SubgType.RESONATOR
-            else f"RCT({nb.label}+{coupler.label}+{na.label})"
-        ),
-    ),
-
-    # T–C–T  →  TCT  (symmetric; left = lower node_id, as determined at call site)
-    (
-        frozenset({SubgType.TRANSMON}),
-        SubgType.TCT,
-        lambda coupler, na, nb: {
-            "L":  na.attrs.get("L",  0.0),
-            "C":  na.attrs.get("C",  0.0),
-            "Cc": coupler.attrs.get("Cc", 0.0),
-            "L2": nb.attrs.get("L",  0.0),
-            "C2": nb.attrs.get("C",  0.0),
-        },
-        lambda coupler, na, nb: f"TCT({na.label}+{coupler.label}+{nb.label})",
-    ),
-
-    # T–C–R  →  TCR  (root=T, leaf=R)
-    (
-        frozenset({SubgType.TRANSMON, SubgType.RESONATOR}),
-        SubgType.TCR,
-        lambda coupler, na, nb: {
-            "L":      (na if na.subg_type == SubgType.TRANSMON  else nb).attrs.get("L",      0.0),
-            "C":      (na if na.subg_type == SubgType.TRANSMON  else nb).attrs.get("C",      0.0),
-            "Cc":     coupler.attrs.get("Cc", 0.0),
-            "length": (na if na.subg_type == SubgType.RESONATOR else nb).attrs.get("length", 0.0),
-        },
-        lambda coupler, na, nb: (
-            f"TCR({na.label}+{coupler.label}+{nb.label})"
-            if na.subg_type == SubgType.TRANSMON
-            else f"TCR({nb.label}+{coupler.label}+{na.label})"
-        ),
-    ),
-
-    # ── ADD NEW LAZY PATTERNS BELOW ───────────────────────────────────────
+    (frozenset({SubgType.TRANSMON, SubgType.RESONATOR}), SubgType.C_COUPLER, _build_lazy_rct),
+    (frozenset({SubgType.TRANSMON}),                    SubgType.C_COUPLER, _build_lazy_tct),
 ]
 
 
@@ -367,9 +363,8 @@ def branch_decomposition(
     adj_raw:  dict[int, list[int]],
 ) -> list[CQEDNode]:
     """
-    Walk a linear branch (root → leaf order) and apply the longest matching
-    pattern.  Directional blocks are assigned correctly because n1 is always
-    the element closer to the root.
+    Walk a linear branch and apply the longest matching pattern from the
+    subgraph basis.  Returns a list of new (compressed) CQEDNodes.
     """
     def _copy(n: CQEDNode) -> CQEDNode:
         return CQEDNode(n.subg_type, dict(n.attrs), n.node_id, n.label)
@@ -422,12 +417,11 @@ _COUPLER_TYPES = {SubgType.C_COUPLER, SubgType.I_COUPLER}
 def _lazy_merge(topology: CQEDTopology) -> CQEDTopology:
     """
     Iterative pass over the compressed graph: merge any remaining degree-2
-    coupler between two nodes that match a LAZY_PATTERNS entry.
+    coupler that sits between two nodes matching a pattern in LAZY_PATTERNS.
 
-    For directional 3-node blocks (RCT, TCR) the orientation is inferred
-    from the BFS tree rooted at find_root().  na = root-facing neighbour,
-    nb = leaf-facing neighbour.
+    Iterates until no more merges are possible.
     """
+
     def _adj_temp():
         a: dict[int, list[int]] = {n.node_id: [] for n in topology._nodes}
         for u, v in topology._edges:
@@ -435,29 +429,10 @@ def _lazy_merge(topology: CQEDTopology) -> CQEDTopology:
             a[v].append(u)
         return a
 
-    def _bfs_depth(root_id: int, adj: dict) -> dict[int, int]:
-        depth = {root_id: 0}
-        queue = [root_id]
-        while queue:
-            curr = queue.pop(0)
-            for nb in adj[curr]:
-                if nb not in depth:
-                    depth[nb] = depth[curr] + 1
-                    queue.append(nb)
-        return depth
-
     changed = True
     while changed:
         changed  = False
         adj      = _adj_temp()
-
-        # Build BFS depth from the current root to orient directional merges
-        if topology._nodes:
-            root_id = find_root(topology)
-            depth   = _bfs_depth(root_id, adj)
-        else:
-            depth = {}
-
         node_map: dict[int, CQEDNode] = {n.node_id: n for n in topology._nodes}
 
         for node in list(topology._nodes):
@@ -468,31 +443,18 @@ def _lazy_merge(topology: CQEDTopology) -> CQEDTopology:
             if len(nbrs) != 2:
                 continue
 
-            na_raw = node_map.get(nbrs[0])
-            nb_raw = node_map.get(nbrs[1])
-            if na_raw is None or nb_raw is None:
+            na = node_map.get(nbrs[0])
+            nb = node_map.get(nbrs[1])
+            if na is None or nb is None:
                 continue
-
-            # Orient: na = root-facing (smaller BFS depth), nb = leaf-facing
-            d0 = depth.get(nbrs[0], 0)
-            d1 = depth.get(nbrs[1], 0)
-            if d0 <= d1:
-                na, nb = na_raw, nb_raw
-            else:
-                na, nb = nb_raw, na_raw
 
             pair_types = frozenset({na.subg_type, nb.subg_type})
 
-            for outer_types, merged_type, attr_fn, label_fn in LAZY_PATTERNS:
-                if pair_types != outer_types:
+            for outer_types, coupler_type, node_builder in LAZY_PATTERNS:
+                if node.subg_type != coupler_type or pair_types != outer_types:
                     continue
 
-                merged = CQEDNode(
-                    subg_type = merged_type,
-                    attrs     = attr_fn(node, na, nb),
-                    node_id   = node.node_id,
-                    label     = label_fn(node, na, nb),
-                )
+                merged = node_builder(node, na, nb)
 
                 ids_to_remove = {node.node_id, na.node_id, nb.node_id}
                 topology._nodes = [
@@ -533,9 +495,7 @@ def _lazy_merge(topology: CQEDTopology) -> CQEDTopology:
 def graphlize(raw_topology: CQEDTopology) -> CQEDTopology:
     """
     Compress a raw CQEDTopology (one node per circuit element) into a new
-    CQEDTopology where each node is a directional macronode block.
-
-    The BFS root determines orientation: left = root-side, right = leaf-side.
+    CQEDTopology where each node represents a subgraph pattern.
     """
     if not raw_topology._nodes:
         return CQEDTopology(name=f"{raw_topology.name}__outer")
@@ -568,10 +528,20 @@ def graphlize(raw_topology: CQEDTopology) -> CQEDTopology:
             for b in branch:
                 if b != last or last_deg <= 2:
                     consumed.add(b)
+            # If the branch stops because it reached another hub, that terminal
+            # hub must be processed exactly once from hub_queue, not materialized
+            # as a pass-through node inside the current branch.  Otherwise graphs
+            # such as F--C_hub--cycle create two macro nodes with the same hub
+            # label: one terminal copy from the incoming branch and one real hub
+            # from the hub pass.  Keep the terminal hub unconsumed and remove it
+            # from the branch decomposition; edge reconstruction will still wire
+            # the previous compressed node to the unique hub via old_to_new.
             if last_deg > 2 and last not in processed_hubs:
                 hub_queue.append(last)
+                branch = branch[:-1]
 
-            hub_branches.append(branch)
+            if branch:
+                hub_branches.append(branch)
         all_branches.append((hub_id, hub_branches))
 
     # ── Step 3: decompose branches ────────────────────────────────────────

@@ -22,6 +22,7 @@ from circuit2graph.definitions import (
 )
 from circuit2graph.topology import CQEDNode, CQEDTopology
 from circuit2graph.compression import branch_decomposition, find_root, graphlize
+from circuit2graph.expansion import expand_graph, expand_macro_graph, expand_node_to_primitives, expand_topology
 
 __all__ = [
     "ATTR_INDEX",
@@ -36,4 +37,8 @@ __all__ = [
     "branch_decomposition",
     "graphlize",
     "find_root",
+    "expand_topology",
+    "expand_graph",
+    "expand_macro_graph",
+    "expand_node_to_primitives",
 ]

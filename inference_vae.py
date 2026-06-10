@@ -54,68 +54,27 @@ DS_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#B279A2"]
 
 
 
-def _unit_for_attr(attr: str) -> str:
-    """Return the physical unit for display names such as L3, C3, Cc2."""
-    if attr in UNITS:
-        return UNITS[attr]
-    base = attr.rstrip("0123456789")
-    return UNITS.get(base, "")
-
-
 def _unique_attr_names_from_graph(g):
-    """Return unique display names in the same order as sample.y/scaler columns.
+    """Return display names in the exact same order as sample.y/scaler columns.
 
-    A compressed TCT block exports [L, C, Cc, L2, C2].  Those names are
-    local to the block: L2/C2 mean "second transmon inside this TCT", not
-    global parameter names.  Therefore a later standalone TRANSMON must become
-    L3/C3, otherwise the dict used for reports/plots overwrites one of the
-    transmons and only two qubits appear.
+    Important for TCT: the compressed TCT node has attrs
+    [L, C, Cc, L2, C2].  Using DATASETS[ds].block_params or a single dict
+    would relabel/drop duplicated L/C columns.
     """
     names = []
-    counts: dict[str, int] = {}
-    transmon_count = 0
-    pending_c_for_transmon: int | None = None
-    pending_c2_for_transmon: int | None = None
-
-    def indexed(base: str, idx: int) -> str:
-        return base if idx == 1 else f"{base}{idx}"
-
-    def next_non_transmon_name(base: str) -> str:
-        counts[base] = counts.get(base, 0) + 1
-        return base if counts[base] == 1 else f"{base}{counts[base]}"
-
+    counts = {}
     for st_int in g.node_types:
         for attr_name in SUBG_DEFS[SubgType(st_int)].attrs:
-            if attr_name == "L":
-                transmon_count += 1
-                pending_c_for_transmon = transmon_count
-                names.append(indexed("L", transmon_count))
-
-            elif attr_name == "C":
-                if pending_c_for_transmon is None:
-                    names.append(next_non_transmon_name("C"))
-                else:
-                    names.append(indexed("C", pending_c_for_transmon))
-                    pending_c_for_transmon = None
-
-            elif attr_name == "L2":
-                transmon_count += 1
-                pending_c2_for_transmon = transmon_count
-                names.append(indexed("L", transmon_count))
-
-            elif attr_name == "C2":
-                if pending_c2_for_transmon is None:
-                    names.append(next_non_transmon_name("C2"))
-                else:
-                    names.append(indexed("C", pending_c2_for_transmon))
-                    pending_c2_for_transmon = None
-
+            base = attr_name
+            if base in ("L2", "C2"):
+                display = base
+            elif base in counts:
+                counts[base] += 1
+                display = f"{base}{counts[base]}"
             else:
-                names.append(next_non_transmon_name(attr_name))
-
-    if len(names) != len(set(names)):
-        raise RuntimeError(f"Duplicate parameter names after graph naming: {names}")
-
+                counts[base] = 1
+                display = base
+            names.append(display)
     return names
 
 
@@ -457,7 +416,7 @@ def print_report(branch_name: str, results: dict, decode_used_ds_ids: bool, ds_m
         print(f"    {'Attr':<10} {'R²':>10} {'RMSE':>14} {'N_valid':>8}  scala")
         print("    " + "-" * 48)
         for attr, m in pm_metrics.items():
-            unit = _unit_for_attr(attr)
+            unit = UNITS.get(attr, "")
             log_label = "(log10)" if m.get("log_scale") else "      "
             print(f"    {attr:<10} {_fmt(m['r2']):>10} {_fmt(m['rmse']):>10} {unit:<4} {m['n_valid']:>6}  {log_label}")
     print()
@@ -514,10 +473,10 @@ def plot_scatter(results: dict, out_path: str, n_samples: int, branch: str, ckpt
             use_log = (t.max() / t.min()) > 100
             if use_log:
                 tv, pv = np.log10(t), np.log10(p)
-                ax_label = f"log10 {attr} [{_unit_for_attr(attr) or '?'}]"
+                ax_label = f"log10 {attr} [{UNITS.get(attr, '?')}]"
             else:
                 tv, pv = t, p
-                ax_label = f"{attr} [{_unit_for_attr(attr) or '?'}]"
+                ax_label = f"{attr} [{UNITS.get(attr, '?')}]"
             ax.scatter(tv, pv, s=5, alpha=0.30, color=color, linewidths=0, rasterized=True)
             lo = min(tv.min(), pv.min())
             hi = max(tv.max(), pv.max())
@@ -528,7 +487,7 @@ def plot_scatter(results: dict, out_path: str, n_samples: int, branch: str, ckpt
             ax.set_aspect("equal", adjustable="box")
             r2 = r2_score(tv, pv)
             rms = rmse(t, p)
-            unit = _unit_for_attr(attr)
+            unit = UNITS.get(attr, "")
             short_ds = ds_name.replace("_", " ")
             if len(short_ds) > 26:
                 short_ds = short_ds[:24] + "…"
@@ -608,7 +567,7 @@ def _init_node_style():
         "TCT":       ("TCT", "#76B7B2"),
         "RCT":       ("RCT", "#EDC948"),
         "RC":        ("RC",  "#FF9DA7"),
-        "RIND":      ("RI",  "#9C755F"),
+        "RI":        ("RI",  "#9C755F"),
     }
     for st in SubgType:
         name = st.name

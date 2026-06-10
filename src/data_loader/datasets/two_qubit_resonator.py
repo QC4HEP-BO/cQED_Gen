@@ -2,7 +2,7 @@
 
 Topology (raw):   T1 – Cc_qr1 – R – Cc_qr2 – T2
 After graphlize:  C_COUPLER(Cc_qr1) – TRANSMON(L,C) – RCT(length, Cc_qr2, L, C)
-block_params:     [["Cc"], ["L", "C"], ["length", "Cc", "L", "C"]]
+block_params:     [["Cc"], ["L", "C"], ["length", "Cc", "L", "C", "dir"]]
 
 Note: RCT absorbs R + Cc_qr2 + T2.  T1 is the qubit whose coupler
       becomes the graphlize root (Cc_qr1 has the lower node_id).
@@ -21,7 +21,7 @@ class TwoQubitResonator(DatasetBase):
 
     NAME             = "Two_qubit_resonator"
     DATA_PATH        = "data/Two_qubit_resonator.txt"
-    BLOCK_PARAMS     = [["Cc"], ["L", "C"], ["length", "Cc", "L", "C"]]
+    BLOCK_PARAMS     = [["Cc"], ["L", "C"], ["length", "Cc", "L", "C", "dir"]]
     OBS_SLOTS_ACTIVE = ["f_1", "f_2", "f_3",
                         "chi_11", "chi_22", "chi_12",
                         "chi_33", "chi_13", "chi_23"]

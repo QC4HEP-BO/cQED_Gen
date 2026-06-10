@@ -334,10 +334,14 @@ class GraphVAE(nn.Module):
             else:
                 enc_batch.outer_ei = torch.zeros((2, 0), dtype=torch.long, device=device)
 
-        # Use G_true pre-computed at load time.
+        # Use G_true and saved symmetry-derived permutations pre-computed at load time.
         G_true = [s.g_true_ns for s in samples]
+        attr_perm_indices = [
+            getattr(s, "attr_perm_indices", [list(range(int(s.y.numel())))])
+            for s in samples
+        ]
 
-        return enc_batch, G_true
+        return enc_batch, G_true, attr_perm_indices
 
     # ------------------------------------------------------------------
     # Forward 
@@ -387,7 +391,7 @@ class GraphVAE(nn.Module):
         """
         beta = self.current_beta()
 
-        enc_batch, G_true = self._prepare_batch(samples, scalers)
+        enc_batch, G_true, attr_perm_indices = self._prepare_batch(samples, scalers)
         _dev = next(self.parameters()).device
 
         # ── Pre-computes the type weights a single time per batch ──────────────────────
@@ -459,7 +463,9 @@ class GraphVAE(nn.Module):
                 _adj_true  = _adj_true,
                 _seq_lens  = _seq_lens,
             )
-            loss_attrs_s     = self.param_decoder.loss(z_s, G_true)
+            loss_attrs_s     = self.param_decoder.loss(
+                z_s, G_true, attr_perm_indices=attr_perm_indices
+            )
             loss_attrs_s_val = loss_attrs_s.item()
 
             loss_R_s = loss_topo_s + self.attrs_scale * loss_attrs_s
@@ -545,7 +551,7 @@ class GraphVAE(nn.Module):
 
         Retruns (z, mu, logvar)
         """
-        enc_batch, _ = self._prepare_batch(samples, scalers)
+        enc_batch, _, _ = self._prepare_batch(samples, scalers)
         return self.encoder.encode(enc_batch)
 
     # ------------------------------------------------------------------

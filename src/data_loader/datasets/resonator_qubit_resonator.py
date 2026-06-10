@@ -2,7 +2,7 @@
 
 Topology (raw):   R1 – Cc_qr1 – T – Cc_qr2 – R2
 After graphlize:  C_COUPLER(Cc_qr1) – RESONATOR(length) – RCT(length, Cc_qr2, L, C)
-block_params:     [["Cc"], ["length"], ["length", "Cc", "L", "C"]]
+block_params:     [["Cc"], ["length"], ["length", "Cc", "L", "C", "dir"]]
 
 Note: in the RCT block, length = L_res2, Cc = Cc_qr2.
 Columns:  Cq, Lq1, Cc_qr1, Cc_qr2, L_res1, L_res2
@@ -19,7 +19,7 @@ class ResonatorQubitResonator(DatasetBase):
 
     NAME             = "Resonator_qubit_resonator"
     DATA_PATH        = "data/Resonator_qubit_resonator.txt"
-    BLOCK_PARAMS     = [["Cc"], ["length"], ["length", "Cc", "L", "C"]]
+    BLOCK_PARAMS     = [["Cc"], ["length"], ["length", "Cc", "L", "C", "dir"]]
     OBS_SLOTS_ACTIVE = ["f_1", "f_2", "f_3",
                         "chi_11", "chi_22", "chi_12",
                         "chi_33", "chi_13", "chi_23"]

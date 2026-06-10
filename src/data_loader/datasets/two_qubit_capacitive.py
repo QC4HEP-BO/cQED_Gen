@@ -1,12 +1,12 @@
 """Dataset: two capacitively-coupled transmons.
 
 Topology (raw):   T1 – Cc – T2
-After graphlize:  TCT(L, C, Cc, L2, C2)
-block_params:     [["L", "C", "Cc", "L2", "C2"]]
+After graphlize:  TCT(L, C, Cc, L2, C2, dir)
+block_params:     [["L", "C", "Cc", "L2", "C2", "dir"]]
 
 graphlize always lazy-merges T1–Cc–T2 into a single TCT node.
-Attrs in TCT: L/C belong to the transmon with smaller L (canonical sort),
-              L2/C2 to the other.
+Attrs in TCT preserve traversal/root order: L/C belong to the first transmon
+encountered from the root/canonical traversal, L2/C2 to the second.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ class TwoQubitCapacitive(DatasetBase):
 
     NAME             = "Two_qubit_with_capacitive_coupling"
     DATA_PATH        = "data/Two_qubit_with_capacitive_coupling.txt"
-    BLOCK_PARAMS     = [["L", "C", "Cc", "L2", "C2"]]
+    BLOCK_PARAMS     = [["L", "C", "Cc", "L2", "C2", "dir"]]
     OBS_SLOTS_ACTIVE = ["f_1", "f_2", "chi_11", "chi_22", "chi_12"]
     N_SAMPLES        = 10_000
     INCLUDE_TRAIN    = True
@@ -42,11 +42,8 @@ class TwoQubitCapacitive(DatasetBase):
         if len(nums) < 4:
             return None, None
         Cq, Lq1, Lq2, Cc = nums[:4]
-        # canonical sort: smaller L → T1
-        if Lq1 <= Lq2:
-            L1, C1, L2, C2 = Lq1, Cq, Lq2, Cq
-        else:
-            L1, C1, L2, C2 = Lq2, Cq, Lq1, Cq
+        # Preserve primitive order; do not canonical-sort by value.
+        L1, C1, L2, C2 = Lq1, Cq, Lq2, Cq
         parens = parens_floats(line)
         if len(parens) < 2:
             return None, None
