@@ -56,7 +56,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from types import SimpleNamespace
 
-from circuit2graph.definitions import SubgType, SUBG_DEFS, ATTR_INDEX
+from circuit2graph.definitions import SubgType, SUBG_DEFS, ATTR_INDEX, MACRO_SIGNATURES
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -81,6 +81,89 @@ for _st in SubgType:
 
 def get_attrs_mask(st_int: int, device: torch.device) -> torch.Tensor:
     return _ATTRS_MASK[st_int].to(device)
+
+
+
+
+def _normalize_required_primitives(
+    required_primitives: dict[str, int] | list[dict[str, int]] | None,
+    batch_size: int,
+) -> list[dict[str, int] | None]:
+    """Normalize primitive constraints to one optional dict per batch item.
+
+    accepted format:
+        None                                      -> no constraints
+        {"transmon": 1, "resonator": 2}      -> same constraints for all items
+        [{"transmon": 1}, {"resonator": 2}]  -> per-item constraints
+    """
+    if required_primitives is None:
+        return [None for _ in range(batch_size)]
+
+    if isinstance(required_primitives, dict):
+        clean = {str(k): int(v) for k, v in required_primitives.items() if int(v) > 0}
+        return [clean for _ in range(batch_size)]
+
+    if isinstance(required_primitives, list):
+        if len(required_primitives) != batch_size:
+            raise ValueError(
+                "required_primitives as a list must have one dict per batch item "
+                f"(got {len(required_primitives)} for batch size {batch_size})."
+            )
+        normalized: list[dict[str, int] | None] = []
+        for item in required_primitives:
+            if item is None:
+                normalized.append(None)
+            else:
+                normalized.append({str(k): int(v) for k, v in item.items() if int(v) > 0})
+        return normalized
+
+    raise TypeError(
+        "required_primitives must be None, a dict[str, int], or a list of dict[str, int]."
+    )
+
+
+def _apply_primitive_guidance(
+    last_logit: torch.Tensor,
+    node_types: list[int],
+    required_primitives: dict[str, int] | None,
+    guidance_strength: float,
+) -> torch.Tensor:
+    """Boost macro-node logits that cover missing required primitives.
+
+    Constraints use primitive semantics, not exact macro-node names.  Therefore
+    {"transmon": 1} can be satisfied by TRANSMON, TC, RCT, TCT, etc.
+    """
+    if required_primitives is None or guidance_strength <= 0.0:
+        return last_logit
+
+    covered: dict[str, int] = {}
+    for type_int in node_types:
+        if not (0 <= int(type_int) < N_SUBTYPES):
+            continue
+        for primitive, count in MACRO_SIGNATURES[SubgType(int(type_int))].items():
+            covered[primitive] = covered.get(primitive, 0) + int(count)
+
+    missing = {
+        primitive: max(0, int(required_count) - covered.get(primitive, 0))
+        for primitive, required_count in required_primitives.items()
+    }
+
+    if not any(count > 0 for count in missing.values()):
+        return last_logit
+
+    for nt in range(N_SUBTYPES):
+        signature = MACRO_SIGNATURES[SubgType(nt)]
+        gain = sum(
+            min(int(signature.get(primitive, 0)), missing_count)
+            for primitive, missing_count in missing.items()
+            if missing_count > 0
+        )
+        if gain > 0:
+            last_logit[nt] = last_logit[nt] + guidance_strength * float(gain)
+
+    # Do not allow early termination before all primitive constraints are met.
+    last_logit[END_TYPE] = last_logit[END_TYPE] - guidance_strength * 3.0
+    return last_logit
 
 
 def build_type_class_weights(
@@ -238,7 +321,11 @@ class TransformerTopologyDecoder(nn.Module):
         # ── node types  ─────────────────────────────────────────
         self.embed_t   = nn.Embedding(N_NODE_TYPES, d)
         self.tf_t      = _CausalTransformer(d, nhead, n_layers, dropout)
-        self.head_t    = nn.Linear(d, N_NODE_TYPES)   
+        self.head_t    = nn.Linear(d, N_NODE_TYPES)
+        # Direction is discrete topology (+1/-1) for directional macro-nodes,
+        # not a scaled physical attribute. It shares the type autoregressive
+        # context and is optimized inside L_topo.
+        self.head_dir  = nn.Linear(d, 1)
 
         # ── positions  ──────────────────────────────
         self.embed_p   = nn.Embedding(N_POSITIONS, d)
@@ -297,7 +384,8 @@ class TransformerTopologyDecoder(nn.Module):
         self,
         z_prime:     torch.Tensor,   # [B, d]
         type_seq:    torch.Tensor,   # [B, seq_len]  integers (including START at pos 0)
-    ) -> torch.Tensor:
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Returns logits [B, seq_len, N_NODE_TYPES].
 
@@ -312,7 +400,11 @@ class TransformerTopologyDecoder(nn.Module):
         seq = seq + self.pos_enc[:, :S+1, :]
         out = self.tf_t(seq)                        # [B, S+1, d]
         # logits for positions 1..S (output[0] = z', output[1..S] predicts the types)
-        return self.head_t(out[:, 1:, :])           # [B, S, N_NODE_TYPES]
+        h = out[:, 1:, :]
+        logits = self.head_t(h)
+        if return_hidden:
+            return logits, h
+        return logits           # [B, S, N_NODE_TYPES]
 
     # ------------------------------------------------------------------
     # Branch x^p — positions
@@ -398,7 +490,7 @@ class TransformerTopologyDecoder(nn.Module):
         self,
         G_true: list[SimpleNamespace],
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, torch.Tensor, torch.Tensor]:
         """
         Converts G_true in tensors in order to compute the loss.
 
@@ -411,12 +503,16 @@ class TransformerTopologyDecoder(nn.Module):
         pos_seq  : [B, M]      long
         adj_true : [B, M, M]   float
         seq_lens : list[int]
+        dir_true : [B, M]      float, 1.0 for +dir, 0.0 for -dir
+        dir_mask : [B, M]      bool, True only for directional macro-nodes
         """
         B = len(G_true)
         M = self.max_nodes
         type_seq = torch.full((B, M), START_TYPE, dtype=torch.long, device=device)
         pos_seq  = torch.zeros(B, M, dtype=torch.long, device=device)
         adj_true = torch.zeros(B, M, M, dtype=torch.float, device=device)
+        dir_true = torch.zeros(B, M, dtype=torch.float, device=device)
+        dir_mask = torch.zeros(B, M, dtype=torch.bool, device=device)
         seq_lens: list = []
         for b, g in enumerate(G_true):
             n = len(g.node_types)
@@ -430,12 +526,16 @@ class TransformerTopologyDecoder(nn.Module):
             for k in range(n):
                 if k + 1 < M:
                     pos_seq[b, k + 1] = k + 1 #e.g. tensor([[0, 1, 2, 3, 0]])
+            for k, dval in enumerate(getattr(g, "direction", [])):
+                if k + 1 < M and float(dval) != 0.0:
+                    dir_true[b, k + 1] = 1.0 if float(dval) > 0.0 else 0.0
+                    dir_mask[b, k + 1] = True
             for u, v in g.edges:
                 ui, vi = u + 1, v + 1
                 if ui < M and vi < M:
                     adj_true[b, ui, vi] = 1.0
                     adj_true[b, vi, ui] = 1.0 #e.g. tensor([[0,0,0,0,0,0],# START [0,0,1,0,0,0],# nodo 3rd type [0,1,0,1,0,0],  # nodo 7th type, ...])
-        return type_seq, pos_seq, adj_true, seq_lens
+        return type_seq, pos_seq, adj_true, seq_lens, dir_true, dir_mask
 
     # ------------------------------------------------------------------
     # loss — L_t + L_p + L_e  (senza L_b che è in ParamDecoder)
@@ -459,17 +559,19 @@ class TransformerTopologyDecoder(nn.Module):
         _pos_seq:  "torch.Tensor | None" = None,
         _adj_true: "torch.Tensor | None" = None,
         _seq_lens: "list | None" = None,
+        _dir_true: "torch.Tensor | None" = None,
+        _dir_mask: "torch.Tensor | None" = None,
     ) -> tuple[torch.Tensor, dict]:
         """
         Topological loss (Eq. 7, without L_b):
-            L_topo = λ_t · L_t  +  λ_p · L_p  +  L_e  +  β · KL
+            L_topo = λ_t · L_t  +  λ_p · L_p  +  L_e + L_dir + β · KL
 
         Teacher forcing on all branches.
 
         Parameters
         ----------
         lambda_t, lambda_p : relative weights (defaults from the paper)
-        _type_seq, _pos_seq, _adj_true, _seq_lens : pre-built tensors
+        _type_seq, _pos_seq, _adj_true, _seq_lens, _dir_true, _dir_mask : pre-built tensors
             from tensorize_G_true(). If provided, the tensorisation loop
             is skipped (saves ~18% time per epoch).
 
@@ -491,18 +593,21 @@ class TransformerTopologyDecoder(nn.Module):
             pos_seq  = _pos_seq
             adj_true = _adj_true
             seq_lens = _seq_lens
+            dir_true = _dir_true if _dir_true is not None else torch.zeros_like(type_seq, dtype=torch.float)
+            dir_mask = _dir_mask if _dir_mask is not None else torch.zeros_like(type_seq, dtype=torch.bool)
         else:
             # slow path: build on the fly (backward compat / slow-path fallback)
-            type_seq, pos_seq, adj_true, seq_lens = self.tensorize_G_true(G_true, device)
+            type_seq, pos_seq, adj_true, seq_lens, dir_true, dir_mask = self.tensorize_G_true(G_true, device)
 
         # ── L_t: cross-entropy on node types ────────────────────────────
         # Input:  type_seq[:, :-1]  (everything except the last)
         # Target: type_seq[:, 1:]   (everything except the first — shifted)
         # Sequence goes from 0 to M-1; we predict positions 1..M-1
-        logits_t = self._forward_types(
+        logits_t, h_t = self._forward_types(
             z_prime,
             type_seq[:, :-1],    # [B, M-1]
-        )                         # [B, M-1, N_NODE_TYPES]
+            return_hidden=True,
+        )                         # [B, M-1, N_NODE_TYPES], [B, M-1, d]
 
         target_t = type_seq[:, 1:].clone()   # [B, M-1]
 
@@ -527,6 +632,19 @@ class TransformerTopologyDecoder(nn.Module):
             target_t_ce[mask_t].reshape(-1),
             **ce_kwargs,
         ) if mask_t.any() else torch.zeros(1, device=device)
+
+        # ── L_dir: BCE on compression direction (+1/-1) ─────────────────
+        # type_seq[:, :-1] predicts targets at positions 1..M, so direction
+        # targets/masks are shifted exactly like target_t. Non-directional
+        # blocks are masked out.
+        dir_logits = self.head_dir(h_t).squeeze(-1)
+        dir_target = dir_true[:, 1:]
+        dir_target_mask = dir_mask[:, 1:]
+        loss_dir = F.binary_cross_entropy_with_logits(
+            dir_logits[dir_target_mask],
+            dir_target[dir_target_mask],
+            reduction="mean",
+        ) if dir_target_mask.any() else torch.zeros(1, device=device)
 
         # ── L_p: cross-entropy on positions ──────────────────────────────
         logits_p = self._forward_positions(
@@ -618,13 +736,14 @@ class TransformerTopologyDecoder(nn.Module):
             kl_raw = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
         # ── loss totale ───────────────────────────────────────────────────
-        loss_topo = lambda_t * loss_t + lambda_p * loss_p + loss_e + beta * kl_raw
+        loss_topo = lambda_t * loss_t + lambda_p * loss_p + loss_e + loss_dir + beta * kl_raw
 
         components = {
             "loss_topo":   loss_topo.item(),
             "loss_t":      loss_t.item(),
             "loss_p":      loss_p.item(),
             "loss_e":      loss_e.item(),
+            "loss_dir":    loss_dir.item(),
             "loss_kl":     kl_raw.item(),
         }
         return loss_topo, components
@@ -658,8 +777,10 @@ class TransformerTopologyDecoder(nn.Module):
     @torch.no_grad()
     def decode(
         self,
-        z:          torch.Tensor,
+        z: torch.Tensor,
         stochastic: bool = True,
+        required_primitives: dict[str, int] | list[dict[str, int]] | None = None,
+        guidance_strength: float = 1.0,
     ) -> list[SimpleNamespace]:
         """
         Generates the topology for each z in the batch.
@@ -669,6 +790,12 @@ class TransformerTopologyDecoder(nn.Module):
             2. Generate positions (one per node, conditioned on z)
             3. Generate edges with GNN + Transformer on the cumulative adjacency
 
+        Optional constraint-aware inference:
+            required_primitives can require semantic primitive counts, e.g.
+            {"transmon": 3, "resonator": 1}.  A primitive can be covered by
+            any macro-node whose SUBG_DEFS.components contain it, so TC/RCT/TCT
+            count as containing transmon.  guidance_strength=0.0 disables this.
+
         Returns a list of SimpleNamespace:
             node_types : list[int]        SubgType int for each macro-node
             edges      : list[(int,int)]  edges between macro-nodes (0-based)
@@ -677,23 +804,38 @@ class TransformerTopologyDecoder(nn.Module):
         device = z.device
         B      = z.shape[0]
         z_prime = self.fc_z(z)   # [B, d]
+        required_by_batch = _normalize_required_primitives(required_primitives, B)
 
         results = []
 
         for b in range(B):
             zp = z_prime[b:b+1]   # [1, d]
+            required_for_item = required_by_batch[b]
 
             # ── 1. generate node types ───────────────────────────────────
             node_types: list[int] = []
+            directions: list[float] = []
             current_types = torch.tensor([START_TYPE], dtype=torch.long, device=device).unsqueeze(0)
             # current_types: [1, seq_so_far]
 
             for step in range(self.max_nodes):
-                logits = self._forward_types(zp, current_types)   # [1, seq_so_far, N_NODE_TYPES]
+                logits, h_types = self._forward_types(
+                    zp, current_types, return_hidden=True
+                )                                                   # [1, seq_so_far, N_NODE_TYPES], [1, seq_so_far, d]
                 last_logit = logits[0, -1, :].clone()              # [N_NODE_TYPES]
 
                 # START is not a valid output token during inference.
                 last_logit[START_TYPE] = -1e9
+
+                # Optional Level-1 primitive guidance: boost macro-node types
+                # that cover still-missing required primitives and discourage
+                # END until the constraints are satisfied.
+                last_logit = _apply_primitive_guidance(
+                    last_logit,
+                    node_types,
+                    required_for_item,
+                    guidance_strength,
+                )
 
                 if stochastic:
                     probs    = F.softmax(last_logit, dim=-1)
@@ -709,6 +851,16 @@ class TransformerTopologyDecoder(nn.Module):
                     continue
 
                 node_types.append(new_type)
+                if "dir" in SUBG_DEFS[SubgType(new_type)].attrs:
+                    dir_logit = self.head_dir(h_types[:, -1, :]).squeeze()
+                    if stochastic:
+                        dir_prob = torch.sigmoid(dir_logit)
+                        dir_val = 1.0 if torch.rand(1, device=device).item() < dir_prob.item() else -1.0
+                    else:
+                        dir_val = 1.0 if dir_logit.item() >= 0.0 else -1.0
+                else:
+                    dir_val = 0.0
+                directions.append(dir_val)
                 new_tok = torch.tensor([[new_type]], dtype=torch.long, device=device)
                 current_types = torch.cat([current_types, new_tok], dim=1)
 
@@ -717,6 +869,7 @@ class TransformerTopologyDecoder(nn.Module):
                 r.node_types = []
                 r.edges      = []
                 r.attrs      = []
+                r.direction  = []
                 results.append(r)
                 continue
 
@@ -778,6 +931,7 @@ class TransformerTopologyDecoder(nn.Module):
             r.node_types = node_types
             r.edges      = edges
             r.attrs      = [{} for _ in node_types]
+            r.direction  = directions
             results.append(r)
 
         return results
@@ -833,7 +987,8 @@ class ParamDecoder(nn.Module):
         self.base_heads = nn.ModuleDict()
 
         for st in SubgType:
-            n_out = len(SUBG_DEFS[st].attrs)
+            param_attrs = [a for a in SUBG_DEFS[st].attrs if a != "dir"]
+            n_out = len(param_attrs)
             if n_out == 0:
                 continue
             key = str(int(st))
@@ -1094,7 +1249,7 @@ class ParamDecoder(nn.Module):
             p_parts: list[torch.Tensor] = []
             t_parts: list[torch.Tensor] = []
             for i, st_int in enumerate(g.node_types):
-                attrs = SUBG_DEFS[SubgType(st_int)].attrs
+                attrs = [a for a in SUBG_DEFS[SubgType(st_int)].attrs if a != "dir"]
                 if not attrs or str(st_int) not in self.base_heads:
                     flat_idx += 1
                     continue
@@ -1137,7 +1292,7 @@ class ParamDecoder(nn.Module):
                     all_targets.append(None)
                     all_st_int.append(-1)
                     continue
-                target_vals = [g.attrs[i][a] for a in SUBG_DEFS[SubgType(st_int)].attrs]
+                target_vals = [g.attrs[i][a] for a in SUBG_DEFS[SubgType(st_int)].attrs if a != "dir"]
                 all_targets.append(
                     torch.tensor(target_vals, dtype=torch.float, device=device)
                 )
@@ -1188,7 +1343,7 @@ class ParamDecoder(nn.Module):
                     continue
                 pred = self._predict_node(z_b, x_struct[i], h[i], st_int)
                 attrs_list.append(
-                    {a: float(pred[j].item()) for j, a in enumerate(SUBG_DEFS[SubgType(st_int)].attrs)}
+                    {a: float(pred[j].item()) for j, a in enumerate([x for x in SUBG_DEFS[SubgType(st_int)].attrs if x != "dir"])}
                 )
             results.append(attrs_list)
 
@@ -1221,13 +1376,18 @@ def data_to_graph_ns(sample, scalers_param) -> SimpleNamespace:
     """
     topo_ids = sample.topology_ids.tolist()
     y_flat   = sample.y.tolist()
+    direction = getattr(sample, "direction", None)
+    direction_vals = direction.tolist() if direction is not None else [0.0] * len(topo_ids)
 
     cursor = 0
     scaled_attrs: list[dict] = []
-    for st_int in topo_ids:
+    for idx, st_int in enumerate(topo_ids):
         st   = SubgType(st_int)
         d    = {}
         for attr_name in SUBG_DEFS[st].attrs:
+            if attr_name == "dir":
+                d[attr_name] = float(direction_vals[idx])
+                continue
             d[attr_name] = float(y_flat[cursor])
             cursor += 1
         scaled_attrs.append(d)
@@ -1249,4 +1409,5 @@ def data_to_graph_ns(sample, scalers_param) -> SimpleNamespace:
     g.node_types = topo_ids
     g.edges      = edges
     g.attrs      = scaled_attrs
+    g.direction  = direction_vals
     return g

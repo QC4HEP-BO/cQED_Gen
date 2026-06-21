@@ -11,7 +11,8 @@ HOW TO ADD A NEW DATASET
        build_topology()  →  raw CQEDTopology (template with zero attrs)
        parse_row(line)   →  (attrs_dict, obs_kw_dict) | (None, None)
        parse_obs(...)    →  (obs_vals np.ndarray, obs_mask np.ndarray)
-3. Set the class attributes (NAME, DATA_PATH, BLOCK_PARAMS, …).
+3. Set the three required class attributes: NAME, DATA_PATH, OBS_SLOTS_ACTIVE.
+   Optionally override N_SAMPLES and INCLUDE_TRAIN.
 4. That's it.  schema.py auto-discovers any DatasetBase subclass in this
    package and registers it.  No other file needs to change.
 
@@ -19,6 +20,18 @@ The only exception: if your dataset introduces a new observable type
 (e.g. f_4, chi_44) that does not yet exist in OBS_SLOTS (schema.py),
 append it there first.  That list is intentionally kept centralised
 because its indices must be stable across all datasets and checkpoints.
+
+NOTE ON BLOCK_PARAMS
+--------------------
+There is no longer a BLOCK_PARAMS class attribute to declare.  The list of
+attribute names per compressed block is derived automatically at import time
+from build_topology() + graphlize() + SUBG_DEFS.  It is available as a
+read-only class property:
+
+    MyDataset.block_params   # → list[list[str]]
+
+This means you never have to manually transcribe the graphlize() output; the
+source of truth is SUBG_DEFS in definitions.py.
 """
 
 from __future__ import annotations
@@ -26,7 +39,6 @@ from __future__ import annotations
 import re
 import numpy as np
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from typing import ClassVar
 
 from circuit2graph import CQEDTopology
@@ -78,32 +90,35 @@ class DatasetBase(ABC):
     """
     Abstract base class for a cQED dataset definition.
 
-    Class attributes (set on the subclass, NOT as instance attrs)
-    --------------------------------------------------------------
-    NAME          : str   — unique key used throughout the codebase
-    DATA_PATH     : str   — path to the raw .txt file (relative to repo root)
-    BLOCK_PARAMS  : list[list[str]]
-                    Ordered list of attr-name lists, one per compressed
-                    macro-node produced by graphlize().
-                    Must match SUBG_DEFS[type].attrs exactly for each block.
-                    Derive this by calling graphlize() on a dummy topology
-                    and printing [list(SUBG_DEFS[n.subg_type].attrs)
-                                  for n in compressed._nodes].
+    Required class attributes (set on the subclass, NOT as instance attrs)
+    -----------------------------------------------------------------------
+    NAME             : str   — unique key used throughout the codebase
+    DATA_PATH        : str   — path to the raw .txt file (relative to repo root)
     OBS_SLOTS_ACTIVE : list[str]
-                    Names of the OBS_SLOTS entries this dataset populates.
-                    Used for documentation / sanity checks only; the actual
-                    mask is set inside parse_obs().
+                       Names of the OBS_SLOTS entries this dataset populates.
+                       Used for documentation / sanity checks; the actual mask
+                       is set inside parse_obs().
+
+    Optional class attributes (have defaults)
+    ------------------------------------------
     N_SAMPLES     : int   — rows to reservoir-sample (default 10_000)
     INCLUDE_TRAIN : bool  — if False, excluded from train/val splits but
                             always available for inference.
                             Flip to True to add to training without changing
                             any other file.
+
+    Auto-derived (no need to set manually)
+    ----------------------------------------
+    block_params  : list[list[str]]
+                    Derived at class-definition time from build_topology() and
+                    SUBG_DEFS.  Gives the ordered list of attribute-name lists,
+                    one per compressed macro-node produced by graphlize().
+                    Available as a classmethod / class-level property.
     """
 
     # ── required class attributes ────────────────────────────────────────
     NAME:             ClassVar[str]
     DATA_PATH:        ClassVar[str]
-    BLOCK_PARAMS:     ClassVar[list[list[str]]]
     OBS_SLOTS_ACTIVE: ClassVar[list[str]]
 
     # ── optional class attributes (have defaults) ────────────────────────
@@ -162,3 +177,24 @@ class DatasetBase(ABC):
         obs_vals : np.ndarray [N_OBS_SLOTS]  values (0 where masked)
         obs_mask : np.ndarray [N_OBS_SLOTS]  1 = present, 0 = absent
         """
+
+    # ── auto-derived block_params ─────────────────────────────────────────
+
+    @classmethod
+    def block_params(cls) -> list[list[str]]:
+        """
+        Return the ordered list of attr-name lists, one per compressed
+        macro-node produced by graphlize() on this dataset's topology.
+
+        This is derived automatically from build_topology() + SUBG_DEFS;
+        you never need to declare it manually.
+
+        Example
+        -------
+        >>> TwoQubitResonator.block_params()
+        [['Cc'], ['L', 'C'], ['length', 'Cc', 'L', 'C', 'dir']]
+        """
+        from circuit2graph import graphlize, SUBG_DEFS
+        topo       = cls.build_topology()
+        compressed = graphlize(topo)
+        return [list(SUBG_DEFS[n.subg_type].attrs) for n in compressed._nodes]

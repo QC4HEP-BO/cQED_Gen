@@ -82,10 +82,13 @@ class DatasetDef:
     Mirrors the information stored in a DatasetBase subclass as plain
     attributes so that the rest of the codebase can treat DATASETS as a
     dict[str, DatasetDef] without knowing about the class hierarchy.
+
+    Note: block_params is no longer stored here.  Call
+    dataset_class.block_params() to get the auto-derived list, or use
+    _extract_params() / SUBG_DEFS directly in the training pipeline.
     """
     path:          str
     topology_fn:   Callable
-    block_params:  list[list[str]]
     obs_slots:     list[str]
     n_samples:     int  = 10_000
     include_train: bool = True
@@ -122,7 +125,6 @@ def _discover() -> tuple[
                 defn = DatasetDef(
                     path          = obj.DATA_PATH,
                     topology_fn   = obj.build_topology,
-                    block_params  = obj.BLOCK_PARAMS,
                     obs_slots     = obj.OBS_SLOTS_ACTIVE,
                     n_samples     = obj.N_SAMPLES,
                     include_train = obj.INCLUDE_TRAIN,

@@ -133,8 +133,13 @@ def expand_node_to_primitives(node: CQEDNode) -> list[_PrimitiveSpec]:
     raise ValueError(f"Cannot expand unknown SubgType {st!r}.")
 
 
-def _copy_with_edges(node_specs: dict[int, list[_PrimitiveSpec]], assignments: dict[frozenset, tuple[int, int]], name: str) -> CQEDTopology:
-    """Materialize primitive nodes, internal chain edges and assigned macro edges."""
+def _copy_with_edges(node_specs: dict[int, list[_PrimitiveSpec]], assignments: dict[tuple[int, int], tuple[int, int]], name: str) -> CQEDTopology:
+    """Materialize primitive nodes, internal chain edges and assigned macro edges.
+
+    `assignments` is keyed by the ORIENTED macro edge `(u_old, v_old)`.
+    Do not collapse that key to `frozenset`: the boundary indices are directional
+    (`max_index(u_old) -> min_index(v_old)`).
+    """
     out = CQEDTopology(name=name)
     primitive_ids: dict[tuple[int, int], CQEDNode] = {}
 
@@ -145,9 +150,7 @@ def _copy_with_edges(node_specs: dict[int, list[_PrimitiveSpec]], assignments: d
             out.add_edge(primitive_ids[(old_id, idx)], primitive_ids[(old_id, idx + 1)])
 
     seen: set[frozenset[int]] = {frozenset(e) for e in out._edges}
-    for key in sorted(assignments, key=lambda k: tuple(sorted(k))):
-        u_old, v_old = tuple(key)
-        u_idx, v_idx = assignments[key]
+    for (u_old, v_old), (u_idx, v_idx) in sorted(assignments.items()):
         a = primitive_ids[(u_old, u_idx)]
         b = primitive_ids[(v_old, v_idx)]
         edge_key = frozenset({a.node_id, b.node_id})
@@ -199,110 +202,192 @@ def _validate_recompress(candidate: CQEDTopology, target: CQEDTopology) -> bool:
     return topologies_equivalent(recompressed, target, check_labels=False)
 
 
-def expand_topology(compressed: CQEDTopology, *, validate: bool = True, max_solutions: int = 20000) -> CQEDTopology:
+
+def _macro_adjacency(topology: CQEDTopology) -> dict[int, list[int]]:
+    """Return a deterministic undirected adjacency map for a macro topology."""
+    adj: dict[int, list[int]] = {n.node_id: [] for n in topology._nodes}
+    for u, v in topology._edges:
+        if u == v:
+            continue
+        if u in adj and v in adj:
+            adj[u].append(v)
+            adj[v].append(u)
+    return {nid: sorted(set(nbrs)) for nid, nbrs in adj.items()}
+
+
+def _walk_simple_cycle(start: int, adj: dict[int, list[int]]) -> list[int]:
+    """
+    Deterministically orient a degree-2 component.
+
+    There is no geometric embedding in CQEDTopology, so "anticlockwise" cannot
+    be recovered literally after compression.  We define the recoverable
+    equivalent as one consistent cyclic orientation: start from the chosen root
+    and follow the lowest-id neighbour first.
+    """
+    cycle = [start]
+    prev: int | None = None
+    curr = start
+
+    while True:
+        nbrs = adj[curr]
+        if prev is None:
+            nxt = nbrs[0]
+        else:
+            candidates = [n for n in nbrs if n != prev]
+            if not candidates:
+                break
+            nxt = candidates[0]
+
+        if nxt == start:
+            break
+        if nxt in cycle:
+            # Not a clean simple cycle; return the partial deterministic walk.
+            break
+        cycle.append(nxt)
+        prev, curr = curr, nxt
+
+    return cycle
+
+
+def _oriented_macro_edges(topology: CQEDTopology, *, root_id: int | None = None) -> list[tuple[int, int]]:
+    """
+    Orient compressed edges in the same direction used for expansion.
+
+    * Tree/line components: root -> leaves by BFS levels.
+    * Simple cycles: one consistent cyclic orientation from the component root.
+
+    Compression does not currently store the original primitive root explicitly.
+    In graphs produced by graphlize(), the first emitted compressed node has
+    node_id == 0 and corresponds to the traversal root.  For generated macro
+    graphs, using the lowest node_id gives a deterministic root and keeps the
+    expansion invariant to which macro-node was chosen as long as the same
+    orientation rule is followed.
+    """
+    adj = _macro_adjacency(topology)
+    if not adj:
+        return []
+
+    all_edges = {frozenset({u, v}) for u, nbrs in adj.items() for v in nbrs if u != v}
+    oriented: list[tuple[int, int]] = []
+    oriented_keys: set[frozenset[int]] = set()
+    visited: set[int] = set()
+
+    def add(u: int, v: int) -> None:
+        key = frozenset({u, v})
+        if u != v and key in all_edges and key not in oriented_keys:
+            oriented.append((u, v))
+            oriented_keys.add(key)
+
+    component_roots = []
+    if root_id is not None and root_id in adj:
+        component_roots.append(root_id)
+    component_roots.extend(nid for nid in sorted(adj) if nid not in component_roots)
+
+    for comp_root in component_roots:
+        if comp_root in visited:
+            continue
+
+        # Collect the component.
+        queue = [comp_root]
+        component: list[int] = []
+        visited.add(comp_root)
+        while queue:
+            u = queue.pop(0)
+            component.append(u)
+            for v in adj[u]:
+                if v not in visited:
+                    visited.add(v)
+                    queue.append(v)
+
+        component_set = set(component)
+        is_simple_cycle = (
+            len(component) > 2
+            and all(len([v for v in adj[n] if v in component_set]) == 2 for n in component)
+        )
+
+        if is_simple_cycle:
+            cycle = _walk_simple_cycle(comp_root, adj)
+            if len(cycle) == len(component):
+                for a, b in zip(cycle, cycle[1:]):
+                    add(a, b)
+                add(cycle[-1], cycle[0])
+                continue
+
+        # Default: orient a spanning traversal from the component root to leaves.
+        # Any remaining non-tree/cross edge is oriented from lower BFS rank to
+        # higher BFS rank; ties fall back to node_id for determinism.
+        parent: dict[int, int | None] = {comp_root: None}
+        rank: dict[int, tuple[int, int]] = {comp_root: (0, comp_root)}
+        queue = [comp_root]
+        while queue:
+            u = queue.pop(0)
+            for v in adj[u]:
+                if v in component_set and v not in parent:
+                    parent[v] = u
+                    rank[v] = (rank[u][0] + 1, v)
+                    add(u, v)
+                    queue.append(v)
+
+        for key in sorted(all_edges, key=lambda k: tuple(sorted(k))):
+            u, v = tuple(key)
+            if u not in component_set or v not in component_set or key in oriented_keys:
+                continue
+            if rank.get(u, (10**9, u)) <= rank.get(v, (10**9, v)):
+                add(u, v)
+            else:
+                add(v, u)
+
+    return oriented
+
+
+def _edge_assignments_from_orientation(
+    node_specs: dict[int, list[_PrimitiveSpec]],
+    oriented_edges: list[tuple[int, int]],
+) -> dict[tuple[int, int], tuple[int, int]]:
+    """
+    Map each oriented macro edge u -> v to primitive boundary indices.
+
+    The rule is intentionally simple and order-preserving:
+    - leave u from its highest primitive index;
+    - enter v at its lowest primitive index.
+
+    Because expand_node_to_primitives() has already applied attrs['dir'], the
+    lowest/highest indices are exactly the macro-node boundaries in traversal
+    order.  Primitive singletons use index 0 for both sides.
+    """
+    assignments: dict[tuple[int, int], tuple[int, int]] = {}
+    for u, v in oriented_edges:
+        u_idx = len(node_specs[u]) - 1
+        v_idx = 0
+        assignments[(u, v)] = (u_idx, v_idx)
+    return assignments
+
+
+def expand_topology(compressed: CQEDTopology, *, validate: bool = False, max_solutions: int = 20000) -> CQEDTopology:
     """
     Expand a macro CQEDTopology back to primitive CQEDTopology.
 
-    Parameters
-    ----------
-    compressed:
-        Macro graph produced by `graphlize()` or by a model in the same macro
-        basis.
-    validate:
-        If True, the port assignment is chosen so that recompressing the
-        expanded graph reproduces `compressed` whenever such an assignment is
-        found.  If no validating assignment exists, the deterministic greedy
-        assignment is returned.
-    max_solutions:
-        Safety cap for the backtracking search used to wire macro edges to
-        primitive boundary ports.
+    The external wiring is directional rather than search-based: compressed
+    edges are first oriented root->leaf for line/tree components, or in one
+    consistent cyclic direction for loop components.  Then every oriented edge
+    u -> v is wired from max_index(u) to min_index(v).  This preserves the
+    primitive order induced by attrs['dir'] and keeps each node's attributes on
+    the primitive created for that position.
+
+    Notes
+    -----
+    `validate` and `max_solutions` are kept in the signature for backward
+    compatibility with the older backtracking implementation; they are not used
+    by the directional assignment.
     """
     node_specs = {n.node_id: expand_node_to_primitives(n) for n in compressed._nodes}
     if not node_specs:
         return CQEDTopology(name=f"{compressed.name}__expanded")
 
-    # Boundary ports: primitive singletons have one unconstrained external port;
-    # expanded macro chains expose their two chain endpoints, each at most once.
-    boundary_ports: dict[int, list[int]] = {}
-    port_capacity: dict[tuple[int, int], int | None] = {}
-    for old_id, specs in node_specs.items():
-        if len(specs) == 1:
-            boundary_ports[old_id] = [0]
-            port_capacity[(old_id, 0)] = None  # unlimited: primitive hub/root may have degree > 1
-        else:
-            boundary_ports[old_id] = [0, len(specs) - 1]
-            port_capacity[(old_id, 0)] = 1
-            port_capacity[(old_id, len(specs) - 1)] = 1
-
-    edge_keys = []
-    seen_edges = set()
-    for u, v in compressed._edges:
-        if u == v:
-            continue
-        key = frozenset({u, v})
-        if key not in seen_edges:
-            seen_edges.add(key)
-            edge_keys.append(key)
-
-    # Sort constrained edges first to prune faster.
-    edge_keys.sort(key=lambda k: (sum(1 for nid in k if len(node_specs[nid]) > 1), tuple(sorted(k))), reverse=True)
-
-    def candidates_for(key: frozenset) -> list[tuple[int, int]]:
-        u, v = tuple(key)
-        pairs = [(ui, vi) for ui in boundary_ports[u] for vi in boundary_ports[v]]
-        # Deterministic preference: lower endpoint index first.  The validation
-        # search will override this when the greedy choice is not invertible.
-        return sorted(pairs)
-
-    assignments: dict[frozenset, tuple[int, int]] = {}
-    usage: dict[tuple[int, int], int] = {}
-    attempts = 0
-    first_complete: dict[frozenset, tuple[int, int]] | None = None
-    valid_complete: dict[frozenset, tuple[int, int]] | None = None
-
-    def available(old_id: int, idx: int) -> bool:
-        cap = port_capacity[(old_id, idx)]
-        return cap is None or usage.get((old_id, idx), 0) < cap
-
-    def add_usage(old_id: int, idx: int, delta: int) -> None:
-        key = (old_id, idx)
-        usage[key] = usage.get(key, 0) + delta
-        if usage[key] == 0:
-            usage.pop(key)
-
-    def search(pos: int) -> bool:
-        nonlocal attempts, first_complete, valid_complete
-        if attempts >= max_solutions:
-            return False
-        if pos == len(edge_keys):
-            attempts += 1
-            current = dict(assignments)
-            if first_complete is None:
-                first_complete = current
-            candidate = _copy_with_edges(node_specs, current, f"{compressed.name}__expanded")
-            if not validate or _validate_recompress(candidate, compressed):
-                valid_complete = current
-                return True
-            return False
-
-        key = edge_keys[pos]
-        u, v = tuple(key)
-        for ui, vi in candidates_for(key):
-            if not available(u, ui) or not available(v, vi):
-                continue
-            assignments[key] = (ui, vi)
-            add_usage(u, ui, +1)
-            add_usage(v, vi, +1)
-            if search(pos + 1):
-                return True
-            add_usage(u, ui, -1)
-            add_usage(v, vi, -1)
-            assignments.pop(key, None)
-        return False
-
-    search(0)
-    chosen = valid_complete or first_complete or {}
-    return _copy_with_edges(node_specs, chosen, f"{compressed.name}__expanded")
+    root_id = 0 if 0 in node_specs else min(node_specs)
+    oriented_edges = _oriented_macro_edges(compressed, root_id=root_id)
+    assignments = _edge_assignments_from_orientation(node_specs, oriented_edges)
+    return _copy_with_edges(node_specs, assignments, f"{compressed.name}__expanded")
 
 
 # Backward-compatible aliases that are pleasant to import in notebooks/tests.

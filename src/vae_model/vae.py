@@ -45,7 +45,7 @@ import torch
 import torch.nn as nn
 from types import SimpleNamespace
 
-from circuit2graph.definitions import SubgType
+from circuit2graph.definitions import SubgType, SUBG_DEFS
 from vae_model.encoder import (
     GraphVAEEncoder,
     N_SUBTYPES,
@@ -402,7 +402,7 @@ class GraphVAE(nn.Module):
             end_weight = self.class_weight_end,
         )
         # tensorize_G_true: tensorizes G_true to be faster
-        _type_seq, _pos_seq, _adj_true, _seq_lens = self.decoder.tensorize_G_true(
+        _type_seq, _pos_seq, _adj_true, _seq_lens, _dir_true, _dir_mask = self.decoder.tensorize_G_true(
             G_true, device=_dev
         )
 
@@ -421,6 +421,8 @@ class GraphVAE(nn.Module):
             _pos_seq   = _pos_seq,
             _adj_true  = _adj_true,
             _seq_lens  = _seq_lens,
+            _dir_true  = _dir_true,
+            _dir_mask  = _dir_mask,
         )
 
         # Parametrical loss for the circuit
@@ -438,7 +440,8 @@ class GraphVAE(nn.Module):
         loss_nce   = torch.zeros(1, device=z_c.device)
         loss_cg    = torch.zeros(1, device=z_c.device)
         comp_topo_s: dict = {"loss_topo_s": 0.0, "loss_t_s": 0.0,
-                             "loss_p_s": 0.0,    "loss_e_s": 0.0}
+                             "loss_p_s": 0.0,    "loss_e_s": 0.0,
+                             "loss_dir_s": 0.0}
         comp_align:  dict = {}
         comp_nce:    dict = {}
         comp_cg:     dict = {}
@@ -462,6 +465,8 @@ class GraphVAE(nn.Module):
                 _pos_seq   = _pos_seq,
                 _adj_true  = _adj_true,
                 _seq_lens  = _seq_lens,
+                _dir_true  = _dir_true,
+                _dir_mask  = _dir_mask,
             )
             loss_attrs_s     = self.param_decoder.loss(
                 z_s, G_true, attr_perm_indices=attr_perm_indices
@@ -475,6 +480,7 @@ class GraphVAE(nn.Module):
                 "loss_t_s":    _comp_topo_s["loss_t"],
                 "loss_p_s":    _comp_topo_s["loss_p"],
                 "loss_e_s":    _comp_topo_s["loss_e"],
+                "loss_dir_s":  _comp_topo_s.get("loss_dir", 0.0),
             }
 
             # ── L_KL + L_C (latent space alignment) ───────
@@ -519,6 +525,7 @@ class GraphVAE(nn.Module):
             "loss_t_c": comp_topo_c["loss_t"],
             "loss_p_c": comp_topo_c["loss_p"],
             "loss_e_c": comp_topo_c["loss_e"],
+            "loss_dir_c": comp_topo_c.get("loss_dir", 0.0),
             "loss_kl": comp_topo_c["loss_kl"],
             "loss_attrs_c":  loss_attrs_c.item(),
             **comp_topo_s,
@@ -575,6 +582,12 @@ class GraphVAE(nn.Module):
         graphs          = self.decoder.decode(z, stochastic=stochastic)
         attrs_per_graph = self.param_decoder.predict(z, graphs)
         for g, attrs in zip(graphs, attrs_per_graph):
+            # ParamDecoder returns only continuous/scaled physical attributes.
+            # Reattach discrete direction predicted by the topological decoder so
+            # expand_to_primitive()/graphlize logic sees attrs["dir"] = +/-1.
+            for i, st_int in enumerate(g.node_types):
+                if "dir" in SUBG_DEFS[SubgType(st_int)].attrs:
+                    attrs[i]["dir"] = float(getattr(g, "direction", [0.0] * len(g.node_types))[i])
             g.attrs = attrs
         return graphs
 

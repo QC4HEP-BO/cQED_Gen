@@ -153,6 +153,8 @@ def _compute_attr_perm_indices(topo: CQEDTopology, compressed: CQEDTopology) -> 
     key_to_slot: dict[tuple[str, str], int] = {}
     for node in compressed._nodes:
         for attr_name in SUBG_DEFS[node.subg_type].attrs:
+            if attr_name == "dir":
+                continue
             key = _slot_to_primitive_key(node, attr_name)
             slot_idx = len(slot_keys)
             slot_keys.append(key)
@@ -232,13 +234,17 @@ def _build_enc_tensors(
     circ_nodes = compressed._nodes
     n_circuit  = len(circ_nodes)
 
-    # Build scaled-attrs dict per node from y_scaled (same order as SUBG_DEFS attrs)
+    # Build scaled-attrs dict per node from y_scaled. ``dir`` stays raw (+1/-1)
+    # because it is handled as topology, not as a continuous parameter.
     cursor = 0
     attrs_per_node: list[dict] = []
     for node in circ_nodes:
         attrs = SUBG_DEFS[node.subg_type].attrs
         d: dict = {}
         for attr_name in attrs:
+            if attr_name == "dir":
+                d[attr_name] = float(node.attrs.get("dir", 1.0))
+                continue
             d[attr_name] = float(y_scaled[cursor])
             cursor += 1
         attrs_per_node.append(d)
@@ -329,7 +335,8 @@ def _topo_to_data_vae(
     circ_nodes       = compressed._nodes
     topology_ids     = torch.tensor([int(n.subg_type) for n in circ_nodes], dtype=torch.long)
     block_param_lens = torch.tensor(
-        [len(SUBG_DEFS[n.subg_type].attrs) for n in circ_nodes], dtype=torch.long
+        [len([a for a in SUBG_DEFS[n.subg_type].attrs if a != "dir"]) for n in circ_nodes],
+        dtype=torch.long,
     )
 
     id_to_idx = {n.node_id: i for i, n in enumerate(circ_nodes)}
@@ -350,6 +357,12 @@ def _topo_to_data_vae(
     data.topology_ids     = topology_ids
     data.block_param_lens = block_param_lens
     data.y                = torch.tensor(y_scaled, dtype=torch.float)
+    # Per-macro-node direction target for directional compressed blocks.
+    # 0.0 marks non-directional blocks and is masked out by the topological loss.
+    data.direction        = torch.tensor([
+        float(n.attrs.get("dir", 0.0)) if "dir" in SUBG_DEFS[n.subg_type].attrs else 0.0
+        for n in circ_nodes
+    ], dtype=torch.float)
     data.dataset_name     = ds_name
     data.g_true_ns        = data_to_graph_ns(data, None)
     data.attr_perm_indices = attr_perm_indices if attr_perm_indices is not None else [list(range(int(data.y.numel())))]
@@ -419,7 +432,7 @@ def _build_samples_vae(
     if not compressed_list:
         raise RuntimeError(
             f"All rows filtered out for {ds_name} (max_nodes={max_nodes}). "
-            "Check block_params or topology builder."
+            "Check topology builder and SUBG_DEFS."
         )
 
     Y_raw_np    = np.array(Y_raw, dtype=np.float64)

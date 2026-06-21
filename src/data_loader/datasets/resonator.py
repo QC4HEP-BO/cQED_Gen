@@ -2,7 +2,6 @@
 
 Topology (raw):   R
 After graphlize:  RESONATOR(length)
-block_params:     [["length"]]
 """
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ class Resonator(DatasetBase):
 
     NAME             = "Resonator"
     DATA_PATH        = "data/Resonator.txt"
-    BLOCK_PARAMS     = [["length"]]
     OBS_SLOTS_ACTIVE = ["f_1"]
     N_SAMPLES        = 10_000
     INCLUDE_TRAIN    = True

@@ -165,9 +165,16 @@ def _fill_attrs(raw_topo: CQEDTopology, attr_dict: dict) -> CQEDTopology:
 # ===========================================================================
 
 def _extract_params(compressed: CQEDTopology) -> list[float]:
+    """Extract only continuous physical parameters.
+
+    ``dir`` is a discrete topological/compression attribute (+1/-1), so it
+    must not be log-scaled together with physical parameters.
+    """
     vals = []
     for node in compressed._nodes:
         for attr in SUBG_DEFS[node.subg_type].attrs:
+            if attr == "dir":
+                continue
             vals.append(node.attrs.get(attr, 0.0))
     return vals
 

@@ -2,7 +2,6 @@
 
 Topology (raw):   T1 – Cc – T2
 After graphlize:  TCT(L, C, Cc, L2, C2, dir)
-block_params:     [["L", "C", "Cc", "L2", "C2", "dir"]]
 
 graphlize always lazy-merges T1–Cc–T2 into a single TCT node.
 Attrs in TCT preserve traversal/root order: L/C belong to the first transmon
@@ -19,7 +18,6 @@ class TwoQubitCapacitive(DatasetBase):
 
     NAME             = "Two_qubit_with_capacitive_coupling"
     DATA_PATH        = "data/Two_qubit_with_capacitive_coupling.txt"
-    BLOCK_PARAMS     = [["L", "C", "Cc", "L2", "C2", "dir"]]
     OBS_SLOTS_ACTIVE = ["f_1", "f_2", "chi_11", "chi_22", "chi_12"]
     N_SAMPLES        = 10_000
     INCLUDE_TRAIN    = True

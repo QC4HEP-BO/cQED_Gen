@@ -2,7 +2,6 @@
 
 Topology (raw):   T1 – Cc12 – T2 – Cc23 – T3
 After graphlize:  C_COUPLER(Cc12) – TRANSMON(L,C) – TCT(L,C,Cc23,L2,C2)
-block_params:     [["Cc"], ["L", "C"], ["L", "C", "Cc", "L2", "C2", "dir"]]
 
 Note: TCT absorbs T2 + Cc23 + T3, preserving traversal order T2 -> T3.
       T1 remains as a separate TRANSMON node.
@@ -26,7 +25,6 @@ class ThreeQubitCapacitiveLine(DatasetBase):
 
     NAME             = "Three_qubit_capacitive_line"
     DATA_PATH        = "data/Three_qubit_capacitive_line.txt"
-    BLOCK_PARAMS     = [["Cc"], ["L", "C"], ["L", "C", "Cc", "L2", "C2", "dir"]]
     OBS_SLOTS_ACTIVE = ["f_1", "f_2", "f_3",
                         "chi_11", "chi_22", "chi_12",
                         "chi_33", "chi_13", "chi_23"]

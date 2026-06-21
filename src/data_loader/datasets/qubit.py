@@ -2,7 +2,6 @@
 
 Topology (raw):   T
 After graphlize:  TRANSMON(L, C)
-block_params:     [["L", "C"]]
 """
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ class Qubit(DatasetBase):
 
     NAME             = "Qubit"
     DATA_PATH        = "data/Qubit.txt"
-    BLOCK_PARAMS     = [["L", "C"]]
     OBS_SLOTS_ACTIVE = ["f_1", "chi_11"]
     N_SAMPLES        = 10_000
     INCLUDE_TRAIN    = True

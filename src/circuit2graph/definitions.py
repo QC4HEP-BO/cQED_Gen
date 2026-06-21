@@ -11,9 +11,9 @@ To add a new circuit element (e.g. SQUID):
   1. Add its physical attribute(s) to ATTR_INDEX if not already present.
   2. Add a new member to SubgType (increment enum value).
   3. Add a SubgDef entry to SUBG_DEFS with the descriptor fields filled in.
-  4. Implement the merge rule in cqed/graph/merge_rules.py.
 
-Nothing in this file needs to change beyond steps 1–3.
+That's it for this file.  Any dataset that uses the new element picks up the
+correct block_params automatically — no manual transcription required.
 """
 
 from dataclasses import dataclass, field
@@ -71,8 +71,9 @@ class SubgDef:
     color       : hex color used when drawing circuit graphs
     legend      : label shown in matplotlib legends
     attrs       : ordered list of ATTR_INDEX keys this subgraph exports as
-                  regression targets (must match SUBG_DEFS[type].attrs exactly
-                  in dataset_config.py block_params)
+                  regression targets.  This is the single source of truth —
+                  block_params for every dataset is derived from these lists
+                  automatically via DatasetBase.block_params().
     inner_nodes : list of dicts with keys
                     type_id   – int, encodes the circuit-element kind
                     val_attr  – str | None, ATTR_INDEX key for "val" feature
@@ -224,3 +225,30 @@ SUBG_DEFS: dict[SubgType, SubgDef] = {
 SUBG_NODE:      dict[SubgType, list[str]] = {t: d.components for t, d in SUBG_DEFS.items()}
 NODE_COLORS:    dict[SubgType, str]       = {t: d.color      for t, d in SUBG_DEFS.items()}
 LEGEND_ENTRIES: list[tuple]               = [(t, d.legend)   for t, d in SUBG_DEFS.items()]
+
+# ---------------------------------------------------------------------------
+# 5. Primitive signatures for constraint-aware topology generation
+# ---------------------------------------------------------------------------
+
+# Maps compact component symbols used in SubgDef.components to semantic
+# primitive names accepted by inference constraints.  MACRO_SIGNATURES is
+# derived from SUBG_DEFS, so future macro-nodes are supported automatically as
+# long as their components use these symbols.
+PRIMITIVE_VOCAB: dict[str, str] = {
+    "T": "transmon",
+    "R": "resonator",
+    "C": "coupler",
+    "F": "feedline",
+    "Ind": "inductor",
+}
+
+MACRO_SIGNATURES: dict[SubgType, dict[str, int]] = {}
+for _subg_type, _subg_def in SUBG_DEFS.items():
+    _signature: dict[str, int] = {}
+    for _component in _subg_def.components:
+        _primitive = PRIMITIVE_VOCAB.get(_component)
+        if _primitive is None:
+            continue
+        _signature[_primitive] = _signature.get(_primitive, 0) + 1
+    MACRO_SIGNATURES[_subg_type] = _signature
+

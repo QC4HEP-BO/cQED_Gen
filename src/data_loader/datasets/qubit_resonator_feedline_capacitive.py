@@ -2,7 +2,6 @@
 
 Topology (raw):   F – Cc_rf – R – Cc_qr – T
 After graphlize:  FEEDLINE – RC(length, Cc_rf) – RCT(length, Cc_qr, L, C)
-block_params:     [[], ["Cc"], ["length", "Cc", "L", "C", "dir"]]
 """
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ class QubitResonatorFeedlineCapacitive(DatasetBase):
 
     NAME             = "Qubit_resonator_feedline_capacitive"
     DATA_PATH        = "data/Qubit_resonator_feedline_capacitive.txt"
-    BLOCK_PARAMS     = [[], ["Cc"], ["length", "Cc", "L", "C", "dir"]]
     OBS_SLOTS_ACTIVE = ["f_1", "f_2", "kappa_1", "kappa_2",
                         "chi_11", "chi_22", "chi_12"]
     N_SAMPLES        = 10_000

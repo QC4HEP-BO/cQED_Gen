@@ -2,7 +2,6 @@
 
 Topology (raw):   T1–Cc12–T2,  T1–Cc13–T3,  T2–Cc23–T3  (triangle)
 After graphlize:  C_COUPLER(Cc12) – TCT(L,C,Cc13,L2,C2,dir) – TC(L,C,Cc23,dir)
-block_params:     [["Cc"], ["L","C","Cc","L2","C2","dir"], ["L","C","Cc","dir"]]
 
 Note: TCT absorbs T1 + Cc13 + T3, preserving traversal order T1 -> T3.
       T2 is absorbed with Cc23 as a directional TC block.
@@ -21,7 +20,6 @@ class ThreeQubitCapacitiveStar(DatasetBase):
 
     NAME             = "Three_qubit_capacitive_star"
     DATA_PATH        = "data/Three_qubit_capacitive_star.txt"
-    BLOCK_PARAMS     = [["Cc"], ["L", "C", "Cc", "L2", "C2", "dir"], ["L", "C", "Cc", "dir"]]
     OBS_SLOTS_ACTIVE = ["f_1", "f_2", "f_3",
                         "chi_11", "chi_22", "chi_12",
                         "chi_33", "chi_13", "chi_23"]
