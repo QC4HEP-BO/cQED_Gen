@@ -1,4 +1,4 @@
-# cQED-Gen
+# cQED_Gen
 
 **Generative graph neural networks for the inverse design of superconducting circuit-QED (cQED) circuits.**
 
