@@ -23,6 +23,43 @@ This snapshot corresponds to the final code organization used for the thesis ana
 
 ---
 
+## Table of contents
+
+- [Thesis](#thesis)
+- [Model overview](#model-overview)
+  - [Circuit representation](#circuit-representation)
+  - [Circuit encoder](#circuit-encoder)
+  - [Hamiltonian encoder](#hamiltonian-encoder)
+  - [Decoders](#decoders)
+  - [Training objective](#training-objective)
+- [Hamiltonian observables](#hamiltonian-observables)
+- [Dataset configuration](#dataset-configuration)
+- [Repository layout](#repository-layout)
+  - [Core packages](#core-packages)
+- [Main executable files](#main-executable-files)
+- [`thesis_analysis/`](#thesis_analysis)
+- [Checkpoint](#checkpoint)
+- [Installation](#installation)
+  - [QuLTRA](#qultra)
+  - [Qiskit Metal](#qiskit-metal)
+- [Quick start](#quick-start)
+  - [Training](#training)
+  - [Circuit/topology inference](#circuittopology-inference)
+  - [QuLTRA Hamiltonian validation](#qultra-hamiltonian-validation)
+  - [End-to-end Hamiltonian-conditioned optimization](#end-to-end-hamiltonian-conditioned-optimization)
+  - [Prior sampling](#prior-sampling)
+- [Reproducing the thesis analyses](#reproducing-the-thesis-analyses)
+- [Extending cQED-Gen](#extending-cqed-gen)
+  - [Adding a new dataset / circuit topology](#adding-a-new-dataset--circuit-topology)
+  - [Adding a new observable](#adding-a-new-observable)
+  - [Adding a new primitive circuit element](#adding-a-new-primitive-circuit-element)
+  - [Adding a new macro-node / subgraph basis element](#adding-a-new-macro-node--subgraph-basis-element)
+- [Next steps](#next-steps)
+- [Validation of this snapshot](#validation-of-this-snapshot)
+- [Scope of the physical-layout extension](#scope-of-the-physical-layout-extension)
+
+---
+
 ## Thesis
 
 The physical motivation, graph representation, model architecture, training objective, inverse-design formulation, latent-space optimization, validation studies, ablations, and graph-to-layout extension are described in the thesis.
