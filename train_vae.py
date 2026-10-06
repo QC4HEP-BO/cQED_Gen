@@ -339,11 +339,17 @@ def save_checkpoint(
     path:         str,
 ) -> None:
     buf = io.BytesIO()
-    pickle.dump(scalers, buf)
+    # New checkpoints store the single global scaler explicitly.  Keep the old
+    # ``scalers`` key too so older inference/plot scripts remain compatible.
+    global_scaler = scalers.get("__global__") if isinstance(scalers, dict) else None
+    pickle.dump(global_scaler if global_scaler is not None else scalers, buf)
+    buf_compat = io.BytesIO()
+    pickle.dump(scalers, buf_compat)
     ckpt = {
         **model.state_dict_full(),   # -> {"model_state": ..., "step": ...}
         "config":        config,
-        "scalers":       buf.getvalue(),
+        "global_scaler": buf.getvalue(),
+        "scalers":       buf_compat.getvalue(),
         "train_losses":  train_losses,
         "val_losses":    val_losses,
         "best_val_loss": best_val,
@@ -389,7 +395,13 @@ def load_checkpoint(
     # Apply torch.compile to submodules (same as in train())
     _apply_compile(model, config)
 
-    scalers      = pickle.loads(ckpt["scalers"]) if "scalers" in ckpt else {}
+    if "scalers" in ckpt:
+        scalers = pickle.loads(ckpt["scalers"])
+    elif "global_scaler" in ckpt:
+        gs = pickle.loads(ckpt["global_scaler"])
+        scalers = {"__global__": gs}
+    else:
+        scalers = {}
     train_losses = ckpt.get("train_losses", [])
     val_losses   = ckpt.get("val_losses",   [])
     start_epoch  = ckpt.get("epoch", 0) + 1

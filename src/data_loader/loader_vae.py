@@ -50,9 +50,11 @@ from data_loader.schema import (
     ROW_PARSERS, _is_header,  # _is_header re-exported from datasets._base
     train_datasets,
 )
-from data_loader.processing import ParamScaler, ObsScaler, DatasetScalers
+from data_loader.processing import ParamScaler, ObsScaler, DatasetScalers, build_global_scaler
 from data_loader.processing import (
     _extract_params,
+    _extract_param_attr_names,
+    _extract_attr_matrix_row,
     _fill_attrs,
     _read_raw,
     N_SUBTYPES,
@@ -414,6 +416,7 @@ def _build_samples_vae(
     raw_template    = defn.topology_fn()
     compressed_list = []
     Y_raw           = []
+    Y_attr_names    = []
     obs_vals_raw    = []
     obs_masks_raw   = []
 
@@ -425,6 +428,7 @@ def _build_samples_vae(
             continue
         compressed_list.append((compressed, attr_perm_indices))
         Y_raw.append(_extract_params(compressed))
+        Y_attr_names.append(_extract_param_attr_names(compressed))
         o_val, o_mask = obs_parser(**obs_kw)
         obs_vals_raw.append(o_val)
         obs_masks_raw.append(o_mask)
@@ -444,7 +448,13 @@ def _build_samples_vae(
         os_ = ObsScaler().fit(obs_vals_np, obs_mask_np)
         scalers = DatasetScalers(ps, os_)
 
-    Y_scaled = scalers.param_scaler.transform(Y_raw_np)
+    if getattr(scalers.param_scaler, "mode", "positional") == "attr":
+        Y_scaled = np.vstack([
+            scalers.param_scaler.transform(row, names)
+            for row, names in zip(Y_raw_np, Y_attr_names)
+        ])
+    else:
+        Y_scaled = scalers.param_scaler.transform(Y_raw_np)
 
     samples: list[Data] = []
     for i, (compressed, attr_perm_indices) in enumerate(compressed_list):
@@ -471,42 +481,95 @@ def load_all_datasets_vae(
     """
     Load datasets marked include_train=True and split into train/val/test.
 
-    Datasets with include_train=False (e.g. Three_qubit_capacitive_line) are
-    skipped here but remain available via load_inference_datasets_vae().
-    To add a dataset to training, set include_train=True in its DatasetDef
-    inside schema.py — no other change required.
+    All train datasets share one global DatasetScalers instance.  The parameter
+    scaler is fitted by physical attribute name (ATTR_INDEX), not by flat-vector
+    column position, so it can be reused for new topologies with a different
+    number/order of attributes.
 
     Returns
     -------
     train_list, val_list, test_list : lists of Data objects
-    scalers : dict[ds_name → DatasetScalers]
+    scalers : dict[ds_name -> same global DatasetScalers]
+              plus scalers["__global__"] for explicit checkpoint access.
     """
     rng = random.Random(seed)
     np.random.seed(seed)
 
     train_defs = train_datasets()
 
-    all_scalers: dict = {}
     all_samples: dict = {}
 
-    print("Loading datasets (VAE mode, training split)…")
+    print("Loading datasets (VAE mode, training split, GLOBAL scaler)...")
     print(f"  include_train=True  : {list(train_defs.keys())}")
     inference_only = [k for k, v in DATASETS.items() if not v.include_train]
     if inference_only:
         print(f"  include_train=False : {inference_only}  (inference only)")
 
+    # First pass: reservoir sample and build compressed graphs once, collecting
+    # dense ATTR_INDEX rows/masks for the global parameter scaler and obs rows
+    # for the global observable scaler.
+    raw_by_ds: dict = {}
+    attr_rows: list[np.ndarray] = []
+    attr_masks: list[np.ndarray] = []
+    obs_rows: list[np.ndarray] = []
+    obs_masks: list[np.ndarray] = []
+
     for ds_name, defn in train_defs.items():
-        print(f"\n[{ds_name}]")
-        samples, ds_scalers = _build_samples_vae(
-            ds_name, defn, scalers=None, fit=True, rng=rng,
-            max_nodes=max_nodes,
-        )
-        all_scalers[ds_name] = ds_scalers
+        print(f"\n[{ds_name}] read/build")
+        obs_parser = OBS_PARSERS[ds_name]
+        raw_entries = _read_raw(defn.path, ds_name, defn.n_samples, rng)
+        if not raw_entries:
+            raise RuntimeError(f"No rows loaded from {defn.path}")
+
+        raw_template = defn.topology_fn()
+        items = []
+        for attrs, obs_kw in raw_entries:
+            topo = _fill_attrs(raw_template, attrs)
+            compressed = graphlize(topo)
+            attr_perm_indices = _compute_attr_perm_indices(topo, compressed)
+            if max_nodes and len(compressed._nodes) > max_nodes:
+                continue
+            y_raw = _extract_params(compressed)
+            y_names = _extract_param_attr_names(compressed)
+            a_row, a_mask = _extract_attr_matrix_row(compressed)
+            o_val, o_mask = obs_parser(**obs_kw)
+            items.append((compressed, attr_perm_indices, y_raw, y_names, o_val, o_mask))
+            attr_rows.append(a_row)
+            attr_masks.append(a_mask)
+            obs_rows.append(o_val)
+            obs_masks.append(o_mask)
+
+        if not items:
+            raise RuntimeError(
+                f"All rows filtered out for {ds_name} (max_nodes={max_nodes}). "
+                "Check topology builder and SUBG_DEFS."
+            )
+        raw_by_ds[ds_name] = items
+
+    global_scaler = build_global_scaler(
+        np.asarray(attr_rows, dtype=np.float64),
+        np.asarray(attr_masks, dtype=np.float64),
+        np.asarray(obs_rows, dtype=np.float64),
+        np.asarray(obs_masks, dtype=np.float64),
+    )
+    all_scalers: dict = {ds_name: global_scaler for ds_name in train_defs.keys()}
+    all_scalers["__global__"] = global_scaler
+
+    # Second pass: turn cached raw/compressed objects into PyG samples with the
+    # same global scaler for every topology.
+    for ds_name, items in raw_by_ds.items():
+        print(f"\n[{ds_name}] scale")
+        samples: list[Data] = []
+        for compressed, attr_perm_indices, y_raw, y_names, o_val, o_mask in items:
+            y_scaled = global_scaler.param_scaler.transform(np.asarray(y_raw, dtype=np.float64), y_names)
+            obs_scaled = global_scaler.obs_scaler.transform_row(o_val, o_mask)
+            samples.append(_topo_to_data_vae(
+                compressed, y_scaled, obs_scaled, o_mask,
+                ds_name, attr_perm_indices=attr_perm_indices,
+            ))
         all_samples[ds_name] = samples
-        last    = samples[-1]
-        n_nodes = int(last.enc_n_circuit)
-        n_p     = int(last.y.shape[0])
-        print(f"  → {len(samples)} samples | {n_nodes} outer nodes | {n_p} params")
+        last = samples[-1]
+        print(f"  -> {len(samples)} samples | {int(last.enc_n_circuit)} outer nodes | {int(last.y.shape[0])} params")
 
     train_list: list = []
     val_list:   list = []
@@ -525,12 +588,8 @@ def load_all_datasets_vae(
     rng.shuffle(train_list)
     rng.shuffle(val_list)
 
-    print(
-        f"\nFinal split: train={len(train_list)}  "
-        f"val={len(val_list)}  test={len(test_list)}"
-    )
+    print(f"\nFinal split: train={len(train_list)}  val={len(val_list)}  test={len(test_list)}")
     return train_list, val_list, test_list, all_scalers
-
 
 def load_inference_datasets_vae(
     seed:      int = 42,

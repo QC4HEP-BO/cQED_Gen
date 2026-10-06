@@ -145,6 +145,7 @@ class GraphVAE(nn.Module):
         spec_recon_scale: float = 1.0,
         tau:              float = 0.1,
         class_weight_end: float = 1.0,
+        lambda_phys:      float = 0.0,
     ):
         super().__init__()
 
@@ -159,6 +160,7 @@ class GraphVAE(nn.Module):
         self.spec_recon_scale = spec_recon_scale
         self.tau              = tau
         self.class_weight_end = class_weight_end
+        self.lambda_phys      = lambda_phys
 
         # to be saved in the checkpoint
         self._step: int = 0
@@ -416,6 +418,7 @@ class GraphVAE(nn.Module):
             mu         = mu_c,
             logvar     = logvar_c,
             beta       = beta,
+            lambda_phys        = self.lambda_phys,
             type_class_weights = type_class_weights,
             _type_seq  = _type_seq,
             _pos_seq   = _pos_seq,
@@ -459,7 +462,8 @@ class GraphVAE(nn.Module):
                 z_s, G_true,
                 mu         = None,
                 logvar     = None,
-                beta       = 0.0,  
+                beta       = 0.0,
+                lambda_phys        = self.lambda_phys,
                 type_class_weights = type_class_weights,
                 _type_seq  = _type_seq,
                 _pos_seq   = _pos_seq,
@@ -528,6 +532,7 @@ class GraphVAE(nn.Module):
             "loss_dir_c": comp_topo_c.get("loss_dir", 0.0),
             "loss_kl": comp_topo_c["loss_kl"],
             "loss_attrs_c":  loss_attrs_c.item(),
+            "loss_phys_c":   comp_topo_c.get("loss_phys", 0.0),
             **comp_topo_s,
             "loss_attrs_s":  loss_attrs_s_val,
             "loss_align":    loss_align.item(),

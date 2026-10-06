@@ -20,7 +20,7 @@ import torch
 from collections import defaultdict
 from torch_geometric.data import Data
 
-from circuit2graph import CQEDTopology, CQEDNode, SubgType, SUBG_DEFS, graphlize
+from circuit2graph import CQEDTopology, CQEDNode, SubgType, SUBG_DEFS, ATTR_INDEX, graphlize
 from data_loader.schema import (
     DATASETS, DatasetDef, OBS_PARSERS,
     OBS_SLOTS, N_OBS_SLOTS, OBS_IDX,
@@ -34,30 +34,98 @@ from data_loader.schema import (
 
 class ParamScaler:
     """
-    log10 + StandardScaler for physical circuit parameters (regression targets).
+    log10 + StandardScaler for physical circuit parameters.
 
-    Pipeline: Y_scaled = (log10(|Y|) - mean) / std
-    Inverse:  Y = 10 ** (Y_scaled * std + mean)
+    Two modes are supported:
+      1. legacy positional mode: one mean/std per flat column;
+      2. global attribute mode: one mean/std per ATTR_INDEX entry, selected by
+         attribute name when transforming a topology-specific flat vector.
+
+    Global attribute mode is what allows one scaler to work for unseen
+    topologies whose flat target vectors have different lengths/orderings.
     """
 
     def __init__(self):
         self.mean_: np.ndarray | None = None
         self.std_:  np.ndarray | None = None
+        self.attr_index: dict[str, int] | None = None
+        self.mode: str = "positional"
+
+    @staticmethod
+    def _base_attr(name: str) -> str:
+        # Display/evaluation code may suffix duplicates as L_n2, C_n4, ...
+        return name.rsplit("_n", 1)[0] if "_n" in name else name
 
     def fit(self, Y: np.ndarray) -> "ParamScaler":
-        """Fit on raw parameter matrix Y [N, n_params]."""
+        """Legacy positional fit on raw parameter matrix Y [N, n_params]."""
         Y_log      = np.log10(np.maximum(np.abs(Y), 1e-30))
         self.mean_ = Y_log.mean(axis=0)
         self.std_  = Y_log.std(axis=0)
         self.std_[self.std_ < 1e-8] = 1.0
+        self.attr_index = None
+        self.mode = "positional"
         return self
 
-    def transform(self, Y: np.ndarray) -> np.ndarray:
-        Y_log = np.log10(np.maximum(np.abs(Y), 1e-30))
-        return (Y_log - self.mean_) / self.std_
+    def fit_attr_matrix(self, Y_attr: np.ndarray, mask: np.ndarray) -> "ParamScaler":
+        """Fit globally by ATTR_INDEX column, ignoring absent attributes.
 
-    def inverse_transform(self, Y_scaled: np.ndarray) -> np.ndarray:
-        return 10.0 ** (Y_scaled * self.std_ + self.mean_)
+        Parameters
+        ----------
+        Y_attr : [N, len(ATTR_INDEX)] raw values, arbitrary value where mask=0
+        mask   : [N, len(ATTR_INDEX)] 1 if that physical attribute is present
+        """
+        n_attrs = len(ATTR_INDEX)
+        self.mean_ = np.zeros(n_attrs, dtype=np.float64)
+        self.std_  = np.ones(n_attrs, dtype=np.float64)
+        for attr, j in ATTR_INDEX.items():
+            present = mask[:, j] > 0.5
+            # ``dir`` is discrete and is never part of the continuous target.
+            if attr == "dir" or present.sum() == 0:
+                continue
+            vals = Y_attr[present, j]
+            vals_log = np.log10(np.maximum(np.abs(vals), 1e-30))
+            self.mean_[j] = vals_log.mean()
+            self.std_[j] = max(vals_log.std(), 1e-8)
+        self.attr_index = dict(ATTR_INDEX)
+        self.mode = "attr"
+        return self
+
+    def _indices_for(self, attr_names: list[str] | tuple[str, ...] | None, n_cols: int) -> np.ndarray:
+        if self.mode != "attr":
+            return np.arange(n_cols, dtype=int)
+        if attr_names is None:
+            if n_cols == len(self.mean_):
+                return np.arange(n_cols, dtype=int)
+            raise ValueError(
+                "Global ParamScaler needs attr_names for topology-specific flat vectors "
+                f"with {n_cols} columns. Pass names in the same order as Y."
+            )
+        idx = []
+        for name in attr_names:
+            base = self._base_attr(str(name))
+            if base not in self.attr_index:
+                raise KeyError(f"Unknown physical attribute {name!r}; add it to ATTR_INDEX.")
+            idx.append(self.attr_index[base])
+        return np.asarray(idx, dtype=int)
+
+    def transform(self, Y: np.ndarray, attr_names: list[str] | tuple[str, ...] | None = None) -> np.ndarray:
+        Y = np.asarray(Y, dtype=np.float64)
+        squeeze = Y.ndim == 1
+        if squeeze:
+            Y = Y.reshape(1, -1)
+        idx = self._indices_for(attr_names, Y.shape[1])
+        Y_log = np.log10(np.maximum(np.abs(Y), 1e-30))
+        out = (Y_log - self.mean_[idx]) / self.std_[idx]
+        return out[0] if squeeze else out
+
+    def inverse_transform(self, Y_scaled: np.ndarray, attr_names: list[str] | tuple[str, ...] | None = None) -> np.ndarray:
+        Y_scaled = np.asarray(Y_scaled, dtype=np.float64)
+        squeeze = Y_scaled.ndim == 1
+        if squeeze:
+            Y_scaled = Y_scaled.reshape(1, -1)
+        idx = self._indices_for(attr_names, Y_scaled.shape[1])
+        out = 10.0 ** (Y_scaled * self.std_[idx] + self.mean_[idx])
+        return out[0] if squeeze else out
 
 
 class ObsScaler:
@@ -163,6 +231,47 @@ def _fill_attrs(raw_topo: CQEDTopology, attr_dict: dict) -> CQEDTopology:
 # ===========================================================================
 # Parameter extraction from a compressed topology
 # ===========================================================================
+
+
+def _extract_param_attr_names(compressed: CQEDTopology) -> list[str]:
+    """Return continuous attribute names in the same order as _extract_params()."""
+    names: list[str] = []
+    for node in compressed._nodes:
+        for attr in SUBG_DEFS[node.subg_type].attrs:
+            if attr == "dir":
+                continue
+            names.append(attr)
+    return names
+
+
+def _extract_attr_matrix_row(compressed: CQEDTopology) -> tuple[np.ndarray, np.ndarray]:
+    """Dense [len(ATTR_INDEX)] row + mask for global attribute-scaler fitting."""
+    vals = np.zeros(len(ATTR_INDEX), dtype=np.float64)
+    mask = np.zeros(len(ATTR_INDEX), dtype=np.float64)
+    for node in compressed._nodes:
+        for attr in SUBG_DEFS[node.subg_type].attrs:
+            if attr == "dir":
+                continue
+            j = ATTR_INDEX[attr]
+            vals[j] = float(node.attrs.get(attr, 0.0))
+            mask[j] = 1.0
+    return vals, mask
+
+
+def build_global_scaler(
+    all_attr_vals: np.ndarray,
+    all_attr_masks: np.ndarray,
+    all_obs_vals: np.ndarray,
+    all_obs_masks: np.ndarray,
+) -> DatasetScalers:
+    """Fit one global DatasetScalers over all training datasets.
+
+    Circuit parameters are fitted by physical attribute name via ATTR_INDEX,
+    not by flat-vector position. Observables are fitted per OBS slot as before.
+    """
+    ps = ParamScaler().fit_attr_matrix(all_attr_vals, all_attr_masks)
+    os_ = ObsScaler().fit(all_obs_vals, all_obs_masks)
+    return DatasetScalers(ps, os_)
 
 def _extract_params(compressed: CQEDTopology) -> list[float]:
     """Extract only continuous physical parameters.

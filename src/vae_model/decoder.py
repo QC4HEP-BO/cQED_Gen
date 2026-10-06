@@ -57,6 +57,13 @@ import torch.nn.functional as F
 from types import SimpleNamespace
 
 from circuit2graph.definitions import SubgType, SUBG_DEFS, ATTR_INDEX, MACRO_SIGNATURES
+from circuit2graph.constraints import (
+    build_forbidden_edge_mask,
+    valid_next_macro_types,
+    exists_valid_macro_graph,
+    choose_compatible_macro_edge_orientation,
+    outer_ports,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -550,6 +557,7 @@ class TransformerTopologyDecoder(nn.Module):
         beta:   float = 1.0,
         lambda_t: float = 0.5,
         lambda_p: float = 0.05,
+        lambda_phys: float = 0.0,
         type_class_weights: torch.Tensor | None = None,
         # ── pre-built tensors (optional, fast path) ──────────────────────
         # If provided, skips the Python loop that tensorises G_true.
@@ -735,8 +743,39 @@ class TransformerTopologyDecoder(nn.Module):
         if mu is not None and logvar is not None:
             kl_raw = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
+        # ── L_phys: physical edge constraint penalty (Phase 3) ───────────
+        # Penalises positive logits on physically forbidden edge pairs.
+        # Only active when lambda_phys > 0 (default 0.0 = disabled).
+        # Uses the same forbidden mask logic as inference (Phase 1), but
+        # applied to the batched training logits.
+        # Formula: L_phys = mean(ReLU(logits[forbidden]))
+        #   - ReLU: only penalise logits > 0 (already "confidently wrong")
+        #   - Gradients push forbidden logits toward negative values
+        #   - Does not affect the BCE loss on valid pairs
+        loss_phys = torch.zeros(1, device=device)
+        if lambda_phys > 0.0 and valid_bs:
+            phys_logits_list: list[torch.Tensor] = []
+            for bi, b in enumerate(valid_bs):
+                g  = G_true[b]
+                n  = len(g.node_types)
+                if n < 2:
+                    continue
+                dirs_b = list(getattr(g, "direction", [0.0] * n))
+                _fmask_b = build_forbidden_edge_mask(g.node_types, dirs_b)
+                _ft = torch.tensor(_fmask_b, dtype=torch.bool, device=device)
+                # edge_logits_pad shape: [Bv, max_pairs, 1]
+                # pick only the n*(n-1)//2 valid pairs for this graph
+                n_pairs_b = n * (n - 1) // 2
+                logits_b  = edge_logits_pad[bi, :n_pairs_b, 0]
+                forbidden_logits = logits_b[_ft[:n_pairs_b]]
+                if forbidden_logits.numel() > 0:
+                    phys_logits_list.append(F.relu(forbidden_logits))
+            if phys_logits_list:
+                loss_phys = torch.cat(phys_logits_list).mean()
+
         # ── loss totale ───────────────────────────────────────────────────
-        loss_topo = lambda_t * loss_t + lambda_p * loss_p + loss_e + loss_dir + beta * kl_raw
+        loss_topo = (lambda_t * loss_t + lambda_p * loss_p + loss_e
+                     + loss_dir + beta * kl_raw + lambda_phys * loss_phys)
 
         components = {
             "loss_topo":   loss_topo.item(),
@@ -745,6 +784,7 @@ class TransformerTopologyDecoder(nn.Module):
             "loss_e":      loss_e.item(),
             "loss_dir":    loss_dir.item(),
             "loss_kl":     kl_raw.item(),
+            "loss_phys":   loss_phys.item(),
         }
         return loss_topo, components
 
@@ -761,12 +801,14 @@ class TransformerTopologyDecoder(nn.Module):
         beta:     float = 1.0,
         lambda_t: float = 0.5,
         lambda_p: float = 0.05,
+        lambda_phys: float = 0.0,
         type_class_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         return self.loss(
             z, G_true,
             mu=mu, logvar=logvar, beta=beta,
             lambda_t=lambda_t, lambda_p=lambda_p,
+            lambda_phys=lambda_phys,
             type_class_weights=type_class_weights,
         )
 
@@ -837,6 +879,26 @@ class TransformerTopologyDecoder(nn.Module):
                     guidance_strength,
                 )
 
+                # ── CCGVAE-style macro-node feasibility mask ────────────────
+                # Keep node generation flexible, but forbid macro-node choices
+                # that make it impossible to build at least one connected graph
+                # using only physically valid macro edges.
+                #
+                # This is the cQED analogue of CCGVAE's histogram-compatible
+                # atom-type sampling: the partial state is the list of macro
+                # nodes already emitted, and compatibility means existence of a
+                # connected physical completion.
+                if node_types:  # skip step 0: a single macro-node is admissible
+                    _allowed = set(valid_next_macro_types(
+                        node_types,
+                        directions,
+                        candidates=list(range(N_SUBTYPES)),
+                        allow_empty_fallback=True,
+                    ))
+                    for _nt in range(N_SUBTYPES):
+                        if _nt not in _allowed:
+                            last_logit[_nt] = -1e9
+
                 if stochastic:
                     probs    = F.softmax(last_logit, dim=-1)
                     new_type = int(torch.multinomial(probs, 1).item())
@@ -858,6 +920,27 @@ class TransformerTopologyDecoder(nn.Module):
                         dir_val = 1.0 if torch.rand(1, device=device).item() < dir_prob.item() else -1.0
                     else:
                         dir_val = 1.0 if dir_logit.item() >= 0.0 else -1.0
+
+                    # ── Direction feasibility clamp ───────────────────────
+                    # valid_next_macro_types accepted this type because AT LEAST
+                    # ONE direction is feasible. If head_dir picked the other one,
+                    # override it to the feasible direction so the partial node set
+                    # stays physically connectable.
+                    if len(node_types) > 1:  # skip the very first node
+                        prev_types = node_types[:-1]
+                        prev_dirs  = directions[:]   # directions not yet appended
+                        sampled_ok = exists_valid_macro_graph(
+                            prev_types + [new_type], prev_dirs + [dir_val]
+                        )
+                        if not sampled_ok:
+                            # flip direction and check; if that works, use it
+                            alt_dir = -1.0 if dir_val == 1.0 else 1.0
+                            if exists_valid_macro_graph(
+                                prev_types + [new_type], prev_dirs + [alt_dir]
+                            ):
+                                dir_val = alt_dir
+                            # if neither works (shouldn't happen given the node mask),
+                            # keep the sampled direction and let the edge mask handle it
                 else:
                     dir_val = 0.0
                 directions.append(dir_val)
@@ -872,6 +955,21 @@ class TransformerTopologyDecoder(nn.Module):
                 r.direction  = []
                 results.append(r)
                 continue
+
+            # ── post-loop feasibility check ──────────────────────────────
+            # If max_nodes is reached with a macro-node set that admits no
+            # connected physical graph, keep the sample but warn.  Edge masking
+            # will still prevent non-physical edges; the final validator /
+            # optimizer should penalize disconnected infeasible outputs.
+            if node_types and len(node_types) > 1:
+                if not exists_valid_macro_graph(node_types, directions):
+                    import warnings
+                    warnings.warn(
+                        f"[MacroMask] max_nodes={self.max_nodes} reached with "
+                        f"no connected physical macro graph available. "
+                        f"types={[SubgType(t).name for t in node_types]}",
+                        RuntimeWarning, stacklevel=2,
+                    )
 
             N = len(node_types)
 
@@ -910,21 +1008,96 @@ class TransformerTopologyDecoder(nn.Module):
                 edge_logits = self._forward_edges(zp, type_embs, adj_running)
                 # [1, N*(N-1)/2, 1]
 
+                # ── Phase 1: physical edge mask ───────────────────────────────
+                # Forbid macro-node pairs that are physically incompatible
+                # in both possible orientations. If a pair is selected, it is
+                # stored in the compatible orientation so loop-closing edges
+                # such as TCT--C--TC--TCT are allowed.
+                # Built from the COMPAT table in constraints.py — O(N^2) but
+                # N <= 8 so this is negligible.
+                _forbidden = build_forbidden_edge_mask(node_types, directions)
+                _fmask = torch.tensor(_forbidden, dtype=torch.bool, device=device)
+                edge_logits = edge_logits.clone()
+                edge_logits[0, _fmask, 0] = -1e9
+
+                # ── Phase 2: coupler degree tracker ──────────────────────────
+                # Each coupler primitive has exactly 2 ports: one consumed
+                # internally by the macro-node chain, one available externally.
+                # Therefore a macro-node whose right_port is a coupler can be
+                # the SOURCE of at most 1 macro edge, and a macro-node whose
+                # left_port is a coupler can be the DESTINATION of at most 1
+                # macro edge.  Violating this would give a primitive coupler
+                # degree > 2, which is physically forbidden.
+                # These sets track which coupler ports are already consumed.
+                _COUPLER_PRIMS = frozenset({
+                    SubgType.C_COUPLER, SubgType.I_COUPLER,
+                })
+                _SINGLE_COUPLER_NODES = frozenset({
+                    int(SubgType.C_COUPLER), int(SubgType.I_COUPLER),
+                })
+
+                def _is_single_coupler_node(k: int) -> bool:
+                    return int(node_types[k]) in _SINGLE_COUPLER_NODES
+
+                _coupler_right_used: set[int] = set()  # nodes whose right coupler port is taken
+                _coupler_left_used:  set[int] = set()  # nodes whose left coupler port is taken
+
+                # Pre-compute outer ports for all nodes (cheap, N ≤ 8)
+                _outer: list[tuple] = [
+                    outer_ports(SubgType(node_types[k]), directions[k])
+                    for k in range(N)
+                ]
+
                 idx = 0
                 for i in range(N):
                     for j in range(i):
                         if edge_logits.shape[1] > idx:
                             score = torch.sigmoid(edge_logits[0, idx, 0])
+                            selected = False
                             if stochastic:
-                                if torch.rand(1, device=device).item() < score.item():
-                                    edges.append((j, i))
-                                    adj_running[0, i, j] = 1.0
-                                    adj_running[0, j, i] = 1.0
+                                selected = torch.rand(1, device=device).item() < score.item()
                             else:
-                                if score.item() > 0.5:
-                                    edges.append((j, i))
-                                    adj_running[0, i, j] = 1.0
-                                    adj_running[0, j, i] = 1.0
+                                selected = score.item() > 0.5
+
+                            if selected:
+                                oriented_edge = choose_compatible_macro_edge_orientation(
+                                    j, i, node_types, directions
+                                )
+                                if oriented_edge is not None:
+                                    u, v = oriented_edge
+                                    lp_u, rp_u = _outer[u]
+                                    lp_v, rp_v = _outer[v]
+                                    # Block if this would saturate an already-used coupler port.
+                                    # Bare C/I coupler macro-nodes are special: they expose two external
+                                    # sides and may legitimately act as a bridge between two non-coupler
+                                    # macro-nodes. Do not greedily saturate them here, otherwise valid
+                                    # chains such as RCT-C-T can lose the second edge depending on the
+                                    # sampled node order/orientation.
+                                    if (
+                                        rp_u in _COUPLER_PRIMS
+                                        and u in _coupler_right_used
+                                        and not _is_single_coupler_node(u)
+                                    ):
+                                        idx += 1
+                                        continue
+                                    if (
+                                        lp_v in _COUPLER_PRIMS
+                                        and v in _coupler_left_used
+                                        and not _is_single_coupler_node(v)
+                                    ):
+                                        idx += 1
+                                        continue
+                                    edges.append((u, v))
+                                    adj_running[0, u, v] = 1.0
+                                    adj_running[0, v, u] = 1.0
+                                    # Mark coupler ports as consumed for compound macro-nodes only.
+                                    # Single C/I couplers are left unconstrained by this greedy tracker;
+                                    # global physical compatibility is still enforced by the forbidden
+                                    # edge mask and final validation.
+                                    if rp_u in _COUPLER_PRIMS and not _is_single_coupler_node(u):
+                                        _coupler_right_used.add(u)
+                                    if lp_v in _COUPLER_PRIMS and not _is_single_coupler_node(v):
+                                        _coupler_left_used.add(v)
                         idx += 1
 
             r            = SimpleNamespace()

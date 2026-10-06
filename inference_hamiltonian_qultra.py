@@ -244,7 +244,13 @@ def _build_model_from_config(config: dict) -> GraphVAE:
 def load_checkpoint(path: str, device: torch.device):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     config = ckpt["config"]
-    scalers = pickle.loads(ckpt["scalers"]) if "scalers" in ckpt else {}
+    if "scalers" in ckpt:
+        scalers = pickle.loads(ckpt["scalers"])
+    elif "global_scaler" in ckpt:
+        gs = pickle.loads(ckpt["global_scaler"])
+        scalers = {"__global__": gs}
+    else:
+        scalers = {}
 
     model = _build_model_from_config(config).to(device)
 
@@ -384,8 +390,9 @@ def run_circuit_encoder(vae: GraphVAE, data: list, scalers: dict, device: torch.
 
         y_true_mat = np.array(true_scaled_rows, dtype=np.float64)
         y_pred_mat = np.array(pred_scaled_rows, dtype=np.float64)
-        y_true_phys = scaler.inverse_transform(y_true_mat)
-        y_pred_phys = scaler.inverse_transform(y_pred_mat)
+        inv_attr_names = [a.rsplit("_n", 1)[0] if "_n" in a else a for a in flat_attrs]
+        y_true_phys = scaler.inverse_transform(y_true_mat, inv_attr_names)
+        y_pred_phys = scaler.inverse_transform(y_pred_mat, inv_attr_names)
 
         param_node_index = {
             attr: int(attr_node_indices[k])
@@ -466,8 +473,9 @@ def run_spec_encoder(vae: GraphVAE, data: list, scalers: dict, device: torch.dev
 
         y_true_mat = np.array(true_scaled_rows, dtype=np.float64)
         y_pred_mat = np.array(pred_scaled_rows, dtype=np.float64)
-        y_true_phys = scaler.inverse_transform(y_true_mat)
-        y_pred_phys = scaler.inverse_transform(y_pred_mat)
+        inv_attr_names = [a.rsplit("_n", 1)[0] if "_n" in a else a for a in flat_attrs]
+        y_true_phys = scaler.inverse_transform(y_true_mat, inv_attr_names)
+        y_pred_phys = scaler.inverse_transform(y_pred_mat, inv_attr_names)
 
         param_node_index = {
             attr: int(attr_node_indices[k])
@@ -887,7 +895,13 @@ def _make_debug_topologies_for_sample(s, g_pred, param_scaler, obs_scaler=None, 
         perms = _get_attr_perm_indices(s, len(true_row_scaled))
         pred_row_scaled, _, _ = _best_pred_row_aligned_to_true_order(true_row_scaled, pred_row_scaled, perms)
 
-    pred_row_phys = _inverse_scaled_row_safe(param_scaler, pred_row_scaled)
+    inv_attr_names = [
+        a.rsplit("_n", 1)[0] if "_n" in a else a
+        for a in _unique_attr_names_from_graph(g_true_scaled)
+    ]
+    pred_row_phys = _inverse_scaled_row_safe(
+        param_scaler, pred_row_scaled, inv_attr_names
+    )
     g_pred_phys = _graph_from_flat_attrs_like(g_true_scaled, pred_row_phys, "pred_aligned")
     pred_topo = _graph_ns_to_cqed_topology(g_pred_phys, name=f"{s.dataset_name}_pred_macro_aligned")
     try:
@@ -1298,9 +1312,11 @@ def _graph_from_flat_attrs_like(g_template, flat_values, name: str):
     return out
 
 
-def _inverse_scaled_row_safe(scaler, row):
+def _inverse_scaled_row_safe(scaler, row, attr_names=None):
     row = np.asarray(row, dtype=np.float64).reshape(1, -1)
-    return scaler.inverse_transform(row)[0]
+    if attr_names is None:
+        return scaler.inverse_transform(row)[0]
+    return scaler.inverse_transform(row, attr_names)[0]
 
 
 def _to_float_array(values, n_expected: int) -> np.ndarray:
@@ -2418,7 +2434,13 @@ def _maybe_physics_eval_sample(s, g_pred, param_scaler, obs_scaler, qu, f_min: f
         perms = _get_attr_perm_indices(s, len(true_row_scaled))
         pred_row_scaled, _, _ = _best_pred_row_aligned_to_true_order(true_row_scaled, pred_row_scaled, perms)
 
-    pred_row_phys = _inverse_scaled_row_safe(param_scaler, pred_row_scaled)
+    inv_attr_names = [
+        a.rsplit("_n", 1)[0] if "_n" in a else a
+        for a in _unique_attr_names_from_graph(g_true_scaled)
+    ]
+    pred_row_phys = _inverse_scaled_row_safe(
+        param_scaler, pred_row_scaled, inv_attr_names
+    )
     g_pred_phys = _graph_from_flat_attrs_like(g_true_scaled, pred_row_phys, "pred_aligned")
     pred_topo = _graph_ns_to_cqed_topology(g_pred_phys, name=f"{s.dataset_name}_pred")
 

@@ -228,7 +228,13 @@ def _build_model_from_config(config: dict) -> GraphVAE:
 def load_checkpoint(path: str, device: torch.device):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     config = ckpt["config"]
-    scalers = pickle.loads(ckpt["scalers"]) if "scalers" in ckpt else {}
+    if "scalers" in ckpt:
+        scalers = pickle.loads(ckpt["scalers"])
+    elif "global_scaler" in ckpt:
+        gs = pickle.loads(ckpt["global_scaler"])
+        scalers = {"__global__": gs}
+    else:
+        scalers = {}
 
     model = _build_model_from_config(config).to(device)
 
@@ -429,8 +435,9 @@ def run_circuit_encoder(vae: GraphVAE, data: list, scalers: dict, device: torch.
 
         y_true_mat = np.array(true_scaled_rows, dtype=np.float64)
         y_pred_mat = np.array(pred_scaled_rows, dtype=np.float64)
-        y_true_phys = scaler.inverse_transform(y_true_mat)
-        y_pred_phys = scaler.inverse_transform(y_pred_mat)
+        inv_attr_names = [a.rsplit("_n", 1)[0] if "_n" in a else a for a in flat_attrs]
+        y_true_phys = scaler.inverse_transform(y_true_mat, inv_attr_names)
+        y_pred_phys = scaler.inverse_transform(y_pred_mat, inv_attr_names)
 
         param_node_index = {
             attr: int(attr_node_indices[k])
@@ -512,8 +519,9 @@ def run_spec_encoder(vae: GraphVAE, data: list, scalers: dict, device: torch.dev
 
         y_true_mat = np.array(true_scaled_rows, dtype=np.float64)
         y_pred_mat = np.array(pred_scaled_rows, dtype=np.float64)
-        y_true_phys = scaler.inverse_transform(y_true_mat)
-        y_pred_phys = scaler.inverse_transform(y_pred_mat)
+        inv_attr_names = [a.rsplit("_n", 1)[0] if "_n" in a else a for a in flat_attrs]
+        y_true_phys = scaler.inverse_transform(y_true_mat, inv_attr_names)
+        y_pred_phys = scaler.inverse_transform(y_pred_mat, inv_attr_names)
 
         param_node_index = {
             attr: int(attr_node_indices[k])
